@@ -6,7 +6,8 @@ from typing import List, Optional, Literal, Tuple
 import subprocess
 
 import requests
-import github
+
+Side = Literal["RIGHT", "LEFT"]
 
 
 @dataclass
@@ -14,9 +15,9 @@ class Comment:
     body: str
     line: int
     path: str
-    side: Literal["RIGHT", "LEFT"]
+    side: Side
     start_line: Optional[int]
-    start_side: Optional[Literal["RIGHT", "LEFT"]]
+    start_side: Optional[Side]
 
     def to_json(self) -> dict:
         return {
@@ -162,46 +163,54 @@ def get_config_file_path():
     return os.path.join(review_dir, "config.json")
 
 
-def update_configuration(args):
+def update_configuration(repository: str):
     config_file_path = get_config_file_path()
     if os.path.exists(config_file_path):
         print("Warning: overwriting existing configuration.")
-    owner, repo = args.repository.split("/")
+    owner, repo = repository.split("/")
     with open(config_file_path, "w") as f:
         json.dump({"owner": owner, "repo": repo}, f, indent=2)
 
 
-def add_comment(args):
-    review = get_review(args.pull_request)
+def add_comment(
+    pull_request: int,
+    body: str,
+    line: int,
+    path: str,
+    side: Side,
+    start_line: Optional[int] = None,
+    start_side: Optional[Side] = None,
+):
+    review = get_review(pull_request)
     review.add_comment(
-        args.body,
-        args.line,
-        args.path,
-        args.side,
-        args.start_line,
-        args.start_side,
+        body,
+        line,
+        path,
+        side,
+        start_line,
+        start_side,
     )
     review.save()
 
 
-def list_comments(args):
-    review = get_review(args.pull_request)
+def list_comments(pull_request: int):
+    review = get_review(pull_request)
     print(json.dumps([c.to_json() for c in review.comments], indent=2))
 
 
-def add_review(args):
-    review = get_review(args.pull_request)
-    review.set_body(args.body)
+def add_review(pull_request: int, body: str):
+    review = get_review(pull_request)
+    review.set_body(body)
     review.save()
 
 
-def list_review(args):
-    review = get_review(args.pull_request)
+def list_review(pull_request: int):
+    review = get_review(pull_request)
     print(review.body)
 
 
-def submit_review(args):
-    review = get_review(args.pull_request)
+def submit_review(pull_request: int):
+    review = get_review(pull_request)
     review.publish(os.getenv("GH_API_TOKEN"))
 
 
@@ -213,7 +222,9 @@ def get_args():
     config_parser.add_argument(
         "repository", help="Repository name in the format of {owner}/{repo}"
     )
-    config_parser.set_defaults(func=update_configuration)
+    config_parser.set_defaults(
+        func=(lambda args: update_configuration(args.repository(args)))
+    )
 
     comment_parser = subparsers.add_parser("comment")
     comment_subparser = comment_parser.add_subparsers()
@@ -238,14 +249,26 @@ def get_args():
     add_comment_parser.add_argument(
         "--start-side", help="body text of the comment to add", required=False
     )
-    add_comment_parser.set_defaults(func=add_comment)
+    add_comment_parser.set_defaults(
+        func=(
+            lambda args: add_comment(
+                args.pull_request,
+                args.body,
+                args.line,
+                args.path,
+                args.side,
+                args.start_line,
+                args.start_side,
+            )
+        )
+    )
     list_comments_parser = comment_subparser.add_parser(
         "list", help="List the comments for a given pull request review"
     )
     list_comments_parser.add_argument(
         "--pull-request", help="Pull request number for which to view comments"
     )
-    list_comments_parser.set_defaults(func=list_comments)
+    list_comments_parser.set_defaults(func=(lambda args: list_comments(args.pull_request)))
 
     review_parser = subparsers.add_parser("review")
     review_subparser = review_parser.add_subparsers()
@@ -256,7 +279,7 @@ def get_args():
         "--pull-request", help="Pull request number to review"
     )
     add_review_parser.add_argument("--body", help="body text of the review to add")
-    add_review_parser.set_defaults(func=add_review)
+    add_review_parser.set_defaults(func=(lambda args: add_review(args.pull_request, args.body)))
     list_review_parser = review_subparser.add_parser(
         "list", help="List any existing top-level review comment for a given PR review"
     )
@@ -264,13 +287,13 @@ def get_args():
         "--pull-request",
         help="Pull request number for which to view the top-level review comment",
     )
-    list_review_parser.set_defaults(func=list_review)
+    list_review_parser.set_defaults(func=(lambda args: list_review(args.pull_request)))
 
     submit_parser = subparsers.add_parser("submit")
     submit_parser.add_argument(
         "--pull-request", help="Pull request number for which to submit a review"
     )
-    submit_parser.set_defaults(func=submit_review)
+    submit_parser.set_defaults(func=(lambda args: submit_review(args.pull_request)))
 
     return parser.parse_args()
 
