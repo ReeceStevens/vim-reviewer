@@ -82,8 +82,8 @@ class Review:
             },
         )
 
-    def add_comment(self, *comment_args):
-        self.comments.append(Comment(*comment_args))
+    def add_comment(self, comment: Comment):
+        self.comments.append(comment)
 
     def set_body(self, body: str):
         self.body = body
