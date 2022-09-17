@@ -107,6 +107,21 @@ class Review:
     def deserialize(serialized: str) -> "Review":
         return Review.from_json(json.loads(serialized))
 
+    def get_comment_at_position(self, path: str, line: int) -> Optional[Comment]:
+        """
+        Return the first comment in this review whose span contains the
+        requested file path and line.
+        """
+        eligible_comments = [
+            c for c in self.comments
+            if c.path == path and (
+                line == c.line or (c.start_line is not None and (line >= c.start_line) and (line <= c.line))
+            )
+        ]
+        if eligible_comments:
+            return eligible_comments[0]
+        return None
+
 
 def get_review_directory() -> str:
     """

@@ -12,7 +12,7 @@ class TestPlugin(object):
     review: Optional[offline_pr_review.Review]
     in_progress_comment: Optional[offline_pr_review.Comment]
 
-    def __init__(self, nvim):
+    def __init__(self, nvim: pynvim.api.Nvim):
         self.review_active = False
         self.nvim = nvim
         self.in_progress_comment = None
@@ -57,9 +57,7 @@ class TestPlugin(object):
         return None
 
     # TODO: View existing comments
-    # TODO: Edit an existing comment
     # TODO: Delete an existing comment
-    # TODO: Edit review body
     # TODO: Add additional comments to an already-published review
 
     def new_temporary_buffer(self, on_save_command: Optional[str] = None):
@@ -108,11 +106,11 @@ class TestPlugin(object):
             side='RIGHT',
             start_side='RIGHT'
         )
-        self.new_temporary_buffer(on_save_command='SaveComment')
+        self.new_temporary_buffer(on_save_command='SaveComment new')
 
 
-    @pynvim.command('SaveComment', sync=True)
-    def save_comment(self):
+    @pynvim.command('SaveComment', nargs="*", sync=True)
+    def save_comment(self, args):
         """
         Save the contents of the comment buffer to disk.
 
@@ -123,8 +121,10 @@ class TestPlugin(object):
         contents will be empty before they can be accessed in the case of a
         save-and-exit command (`:wq`).
         """
+        is_new_comment = args[0] == 'new'
         self.in_progress_comment.body = self.current_buffer_contents()
-        self.review.add_comment(self.in_progress_comment)
+        if is_new_comment:
+            self.review.add_comment(self.in_progress_comment)
         self.in_progress_comment = None
         self.review.save()
 
@@ -132,6 +132,7 @@ class TestPlugin(object):
     def review_body(self):
         if self.is_review_active():
             self.new_temporary_buffer(on_save_command='SaveReviewBody')
+            self.nvim.current.buffer[:] = self.review.body
         else:
             self.nvim.err_write("No review is currently active.\n")
 
@@ -150,3 +151,21 @@ class TestPlugin(object):
         if self.is_review_active():
             self.review.body = self.current_buffer_contents()
             self.review.save()
+
+    @pynvim.command('EditComment', nargs="*", range="")
+    def edit_comment(self, args, range):
+        """
+        Open up the comment for the line under the cursor, if one exists.
+        """
+        path = self.current_buffer_path()
+        if path is None:
+            self.nvim.err_write("Current buffer is not a valid path in the git repository.\n")
+            return
+        comment_to_edit = self.review.get_comment_at_position(path, range[0])
+        if comment_to_edit is None:
+            self.nvim.err_write("No comment under the cursor.\n")
+            return
+
+        self.in_progress_comment = comment_to_edit
+        self.new_temporary_buffer(on_save_command='SaveComment existing')
+        self.nvim.current.buffer[:] = self.in_progress_comment.body.split('\n')
