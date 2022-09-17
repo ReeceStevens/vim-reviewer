@@ -19,12 +19,43 @@ class TestPlugin(object):
         # Determine the upstream github URL from the configured git remote
         remote_info = self.nvim.call('FugitiveRemote')
         offline_pr_review.update_configuration(remote_info['path'].replace('.git', ''))
+        self.nvim.command('sign define PrReviewComment text=C> texthl=Search linehl=DiffText')
+
+    # TODO: Can only show signs for files that are already loaded in a buffer.
+    # Need to update signs if a new file is opened.
+    @pynvim.command("UpdateReviewSigns")
+    def update_signs(self):
+        if not self.is_review_active():
+            return
+
+        self.nvim.command('sign unplace * group=PrReviewSigns')
+        self.sign_idx = 0
+        for buffer in self.nvim.buffers:
+            self.update_signs_in_buffer(buffer)
+
+    def update_signs_in_buffer(self, buffer: pynvim.api.Buffer):
+        comments_in_buffer = [
+            c for c in self.review.comments
+            if os.path.join(self.repository_absolute_path(), c.path) == buffer.name
+        ]
+        for comment in comments_in_buffer:
+            start_line = comment.start_line or comment.line
+            end_line = comment.line
+            for line in range(start_line, end_line + 1):
+                self.sign_idx += 1
+                self.nvim.command(f'sign place {self.sign_idx} line={line} name=PrReviewComment group=PrReviewSigns buffer={buffer.handle}')
+
+
+    def save(self):
+        self.review.save()
+        self.update_signs()
 
     @pynvim.command('StartReview', nargs=1)
     def start_review(self, args):
         # TODO: If review already exists for this PR, load it from disk
         self.review = offline_pr_review.new_blank_review(args[0])
         self.review_active = True
+        self.update_signs()
 
     @pynvim.command('PublishReview')
     def publish_review(self):
@@ -41,6 +72,10 @@ class TestPlugin(object):
     @pynvim.function('IsReviewActive', sync=True)
     def is_review_active(self):
         return self.review_active
+
+    def repository_absolute_path(self) -> str:
+        git_dir_path = self.nvim.call('FugitiveGitDir')
+        return git_dir_path[:-len('.git')]
 
     def current_buffer_path(self) -> Optional[str]:
         """
@@ -126,7 +161,7 @@ class TestPlugin(object):
         if is_new_comment:
             self.review.add_comment(self.in_progress_comment)
         self.in_progress_comment = None
-        self.review.save()
+        self.save()
 
     @pynvim.command('ReviewBody', sync=True)
     def review_body(self):
@@ -150,7 +185,7 @@ class TestPlugin(object):
         """
         if self.is_review_active():
             self.review.body = self.current_buffer_contents()
-            self.review.save()
+            self.save()
 
     @pynvim.command('EditComment', nargs="*", range="")
     def edit_comment(self, args, range):
