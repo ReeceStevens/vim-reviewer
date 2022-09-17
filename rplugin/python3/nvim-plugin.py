@@ -59,7 +59,6 @@ class TestPlugin(object):
     # TODO: View existing comments
     # TODO: Edit an existing comment
     # TODO: Delete an existing comment
-    # TODO: Add review body
     # TODO: Edit review body
     # TODO: Add additional comments to an already-published review
 
@@ -79,6 +78,10 @@ class TestPlugin(object):
                 # Set the on-save behavior for this buffer. This uses the buffer-local
                 # autocommands feature.
                 self.nvim.command(f'autocmd BufWritePre <buffer> :{on_save_command}')
+
+    def current_buffer_contents(self) -> str:
+        buffer_contents = self.nvim.current.buffer[:]
+        return '\n'.join(buffer_contents)
 
     @pynvim.command('ReviewComment', sync=True, nargs="?", range='')
     def review_comment(self, args, range):
@@ -120,8 +123,7 @@ class TestPlugin(object):
         contents will be empty before they can be accessed in the case of a
         save-and-exit command (`:wq`).
         """
-        buffer_contents = self.nvim.current.buffer[:]
-        self.in_progress_comment.body = '\n'.join(buffer_contents)
+        self.in_progress_comment.body = self.current_buffer_contents()
         self.review.add_comment(self.in_progress_comment)
         self.in_progress_comment = None
         self.review.save()
@@ -146,6 +148,5 @@ class TestPlugin(object):
         save-and-exit command (`:wq`).
         """
         if self.is_review_active():
-            buffer_contents = self.nvim.current.buffer[:]
-            self.review.body = '\n'.join(buffer_contents)
+            self.review.body = self.current_buffer_contents()
             self.review.save()
