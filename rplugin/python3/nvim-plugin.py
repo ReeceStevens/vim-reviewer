@@ -31,9 +31,12 @@ class TestPlugin(object):
         """
         Publish the in-progress review to GitHub.
         """
-        self.review_active = False
-        result = self.review.publish(os.getenv("GH_API_TOKEN"))
-        self.nvim.out_write(f'{result}\n')
+        if self.review_active:
+            self.review_active = False
+            result = self.review.publish(os.getenv("GH_API_TOKEN"))
+            self.nvim.out_write(f'{result}\n')
+        else:
+            self.nvim.err_write("Cannot publish since no review is currently active.\n")
 
     @pynvim.function('IsReviewActive', sync=True)
     def is_review_active(self):
@@ -60,6 +63,23 @@ class TestPlugin(object):
     # TODO: Edit review body
     # TODO: Add additional comments to an already-published review
 
+    def new_temporary_buffer(self, on_save_command: Optional[str] = None):
+        """
+        Create a new buffer for a temporary file and open it in a split.
+
+        Additionally, set the provided `on_save_command` to be executed on
+        buffer save.
+        """
+        with NamedTemporaryFile('w') as f:
+            # Open a new buffer and focus it
+            self.nvim.command(f'sp {f.name}')
+            # Use markdown highlighting
+            self.nvim.command('set ft=markdown')
+            if on_save_command:
+                # Set the on-save behavior for this buffer. This uses the buffer-local
+                # autocommands feature.
+                self.nvim.command(f'autocmd BufWritePre <buffer> :{on_save_command}')
+
     @pynvim.command('ReviewComment', sync=True, nargs="?", range='')
     def review_comment(self, args, range):
         """
@@ -72,28 +92,20 @@ class TestPlugin(object):
             self.nvim.err_write("A review comment is already being edited.\n")
             return
 
-        with NamedTemporaryFile('w') as f:
-            path = self.current_buffer_path()
-            if path is None:
-                self.nvim.err_write("Current buffer is not a valid path in the git repository.")
-                return
-            self.in_progress_comment = offline_pr_review.Comment(
-                body="",
-                path=path,
-                line=range[1],
-                start_line=range[0],
-                # TODO: eventually get better side detection from buffer names
-                side='RIGHT',
-                start_side='RIGHT'
-            )
-            # Open a new buffer and focus it
-            self.nvim.command(f'sp {f.name}')
-            # Use markdown highlighting
-            self.nvim.command('set ft=markdown')
-
-            # Set the on-save behavior for this buffer. This uses the buffer-local
-            # autocommands feature.
-            self.nvim.command('autocmd BufWritePre <buffer> :SaveComment')
+        path = self.current_buffer_path()
+        if path is None:
+            self.nvim.err_write("Current buffer is not a valid path in the git repository.\n")
+            return
+        self.in_progress_comment = offline_pr_review.Comment(
+            body="",
+            path=path,
+            line=range[1],
+            start_line=range[0],
+            # TODO: eventually get better side detection from buffer names
+            side='RIGHT',
+            start_side='RIGHT'
+        )
+        self.new_temporary_buffer(on_save_command='SaveComment')
 
 
     @pynvim.command('SaveComment', sync=True)
@@ -113,3 +125,27 @@ class TestPlugin(object):
         self.review.add_comment(self.in_progress_comment)
         self.in_progress_comment = None
         self.review.save()
+
+    @pynvim.command('ReviewBody', sync=True)
+    def review_body(self):
+        if self.is_review_active():
+            self.new_temporary_buffer(on_save_command='SaveReviewBody')
+        else:
+            self.nvim.err_write("No review is currently active.\n")
+
+    @pynvim.command('SaveReviewBody', sync=True)
+    def save_review_body(self):
+        """
+        Save the contents of the review body buffer to disk.
+
+        This command is set to be triggered on `BufWritePre` for the review body
+        buffer (e.g., on every write).
+
+        Note that this command _must_ be `sync=True`, otherwise the buffer
+        contents will be empty before they can be accessed in the case of a
+        save-and-exit command (`:wq`).
+        """
+        if self.is_review_active():
+            buffer_contents = self.nvim.current.buffer[:]
+            self.review.body = '\n'.join(buffer_contents)
+            self.review.save()
