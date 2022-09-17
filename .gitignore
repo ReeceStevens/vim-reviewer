@@ -1,1 +1,4 @@
 *venv*
+.gh-token.txt
+*.egg-info
+*__pycache__*
