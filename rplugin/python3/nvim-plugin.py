@@ -16,6 +16,7 @@ class TestPlugin(object):
         self.review_active = False
         self.nvim = nvim
         self.in_progress_comment = None
+        # Determine the upstream github URL from the configured git remote
         remote_info = self.nvim.call('FugitiveRemote')
         offline_pr_review.update_configuration(remote_info['path'].replace('.git', ''))
 
@@ -25,8 +26,11 @@ class TestPlugin(object):
         self.review = offline_pr_review.new_blank_review(args[0])
         self.review_active = True
 
-    @pynvim.command('PublishReview', sync=True)
+    @pynvim.command('PublishReview')
     def publish_review(self):
+        """
+        Publish the in-progress review to GitHub.
+        """
         self.review_active = False
         result = self.review.publish(os.getenv("GH_API_TOKEN"))
         self.nvim.out_write(f'{result}\n')
@@ -35,20 +39,43 @@ class TestPlugin(object):
     def is_review_active(self):
         return self.review_active
 
-    @pynvim.command('ReviewComment', sync=True, nargs='*', range='')
-    def review_comment(self, args, range):
+    def current_buffer_path(self) -> Optional[str]:
+        """
+        Return the buffer's current path in the git repository, or None if it does not exist.
+
+        For example, a file called "test.py" within a parent directory called
+        "project" would return the path `project/test.py`.
+        """
+        git_dir_path = self.nvim.call('FugitiveGitDir')
+        current_buffer_path = self.nvim.current.buffer.name
+        if current_buffer_path.startswith('/') and git_dir_path:
+            repository_root = git_dir_path[:-len('.git')]
+            return current_buffer_path.replace(repository_root, '')
+        return None
+
+    # TODO: View existing comments
+    # TODO: Edit an existing comment
+    # TODO: Delete an existing comment
+    # TODO: Add review body
+    # TODO: Edit review body
+    # TODO: Add additional comments to an already-published review
+
+    @pynvim.command('ReviewComment', sync=True, range='')
+    def review_comment(self, range):
+        """
+        Initiate a review comment for the given range selection.
+
+        This will open up a new buffer for the comment. The comment is saved to
+        disk at every write.
+        """
         if self.in_progress_comment is not None:
             self.nvim.err_write("A review comment is already being edited.\n")
             return
 
         with NamedTemporaryFile('w') as f:
-            git_dir_path = self.nvim.call('FugitiveGitDir')
-            current_buffer_path = self.nvim.current.buffer.name
-            if current_buffer_path.startswith('/') and git_dir_path:
-                repository_root = git_dir_path[:-len('.git')]
-                path = current_buffer_path.replace(repository_root, '')
-            else:
-                # TODO: error handling for trying to comment on a buffer that isn't a file in the repo
+            path = self.current_buffer_path()
+            if path is None:
+                self.nvim.err_write("Current buffer is not a valid path in the git repository.")
                 return
             self.in_progress_comment = offline_pr_review.Comment(
                 body="",
@@ -71,6 +98,16 @@ class TestPlugin(object):
 
     @pynvim.command('SaveComment', sync=True)
     def save_comment(self):
+        """
+        Save the contents of the comment buffer to disk.
+
+        This command is set to be triggered on `BufWritePre` for the comment
+        buffer (e.g., on every write).
+
+        Note that this command _must_ be `sync=True`, otherwise the buffer
+        contents will be empty before they can be accessed in the case of a
+        save-and-exit command (`:wq`).
+        """
         buffer_contents = self.nvim.current.buffer[:]
         self.in_progress_comment.body = '\n'.join(buffer_contents)
         self.review.add_comment(self.in_progress_comment)
