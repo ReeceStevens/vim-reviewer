@@ -21,32 +21,38 @@ class TestPlugin(object):
 
     @pynvim.command('StartReview', nargs=1)
     def start_review(self, args):
+        # TODO: If review already exists for this PR, load it from disk
         self.review = offline_pr_review.new_blank_review(args[0])
         self.review_active = True
 
-    @pynvim.command('PublishReview')
+    @pynvim.command('PublishReview', sync=True)
     def publish_review(self):
         self.review_active = False
-        self.review.publish(os.getenv("GH_API_TOKEN"))
+        result = self.review.publish(os.getenv("GH_API_TOKEN"))
+        self.nvim.out_write(f'{result}\n')
 
     @pynvim.function('IsReviewActive', sync=True)
     def is_review_active(self):
         return self.review_active
 
-    @pynvim.command('ReviewComment', nargs='*', range='')
+    @pynvim.command('ReviewComment', sync=True, nargs='*', range='')
     def review_comment(self, args, range):
         if self.in_progress_comment is not None:
-            self.nvim.err_write("A review comment is already being edited.")
+            self.nvim.err_write("A review comment is already being edited.\n")
             return
 
         with NamedTemporaryFile('w') as f:
-
-            from remote_pdb import RemotePdb; RemotePdb('localhost', 56014).set_trace()
-            # TODO: Determine the path in the git repo for a given buffer name
-            # (self.nvim.current.buffer.name)
+            git_dir_path = self.nvim.call('FugitiveGitDir')
+            current_buffer_path = self.nvim.current.buffer.name
+            if current_buffer_path.startswith('/') and git_dir_path:
+                repository_root = git_dir_path[:-len('.git')]
+                path = current_buffer_path.replace(repository_root, '')
+            else:
+                # TODO: error handling for trying to comment on a buffer that isn't a file in the repo
+                return
             self.in_progress_comment = offline_pr_review.Comment(
                 body="",
-                path=self.nvim.current.buffer.name,
+                path=path,
                 line=range[1],
                 start_line=range[0],
                 # TODO: eventually get better side detection from buffer names
@@ -58,18 +64,15 @@ class TestPlugin(object):
             # Use markdown highlighting
             self.nvim.command('set ft=markdown')
 
-            self.nvim.out_write("open trigger\n")
             # Set the on-save behavior for this buffer. This uses the buffer-local
             # autocommands feature.
-            self.nvim.command(f'autocmd BufWritePre <buffer> :SaveComment {" ".join(range)}')
+            self.nvim.command('autocmd BufWritePre <buffer> :SaveComment')
 
 
-    @pynvim.command('SaveComment', sync=True, nargs='*')
-    def save_comment(self, args):
-        self.nvim.out_write("Save trigger\n")
+    @pynvim.command('SaveComment', sync=True)
+    def save_comment(self):
         buffer_contents = self.nvim.current.buffer[:]
-        self.nvim.out_write(f"{buffer_contents}\n")
-        self.nvim.out_write(f"{args}\n")
         self.in_progress_comment.body = '\n'.join(buffer_contents)
         self.review.add_comment(self.in_progress_comment)
         self.in_progress_comment = None
+        self.review.save()
