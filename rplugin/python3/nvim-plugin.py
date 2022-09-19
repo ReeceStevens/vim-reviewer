@@ -52,8 +52,7 @@ class TestPlugin(object):
 
     @pynvim.command('StartReview', nargs=1)
     def start_review(self, args):
-        # TODO: If review already exists for this PR, load it from disk
-        self.review = offline_pr_review.new_blank_review(args[0])
+        self.review = offline_pr_review.get_or_create_review(args[0])
         self.review_active = True
         self.update_signs()
 
@@ -65,7 +64,7 @@ class TestPlugin(object):
         if self.review_active:
             self.review_active = False
             result = self.review.publish(os.getenv("GH_API_TOKEN"))
-            self.nvim.out_write(f'{result}\n')
+            self.nvim.out_write(f'{result}: {result.reason}\n')
         else:
             self.nvim.err_write("Cannot publish since no review is currently active.\n")
 
