@@ -166,7 +166,7 @@ class TestPlugin(object):
     def review_body(self):
         if self.is_review_active():
             self.new_temporary_buffer(on_save_command='SaveReviewBody')
-            self.nvim.current.buffer[:] = self.review.body
+            self.nvim.current.buffer[:] = self.review.body.split('\n')
         else:
             self.nvim.err_write("No review is currently active.\n")
 
