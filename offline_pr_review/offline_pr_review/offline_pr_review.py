@@ -236,7 +236,7 @@ def list_review(pull_request: int):
 
 def submit_review(pull_request: int):
     review = get_review(pull_request)
-    review.publish(os.getenv("GH_API_TOKEN"))
+    review.publish(os.getenv("GH_REVIEW_API_TOKEN"))
 
 
 def get_args():

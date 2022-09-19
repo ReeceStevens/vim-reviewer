@@ -63,7 +63,7 @@ class TestPlugin(object):
         """
         if self.review_active:
             self.review_active = False
-            result = self.review.publish(os.getenv("GH_API_TOKEN"))
+            result = self.review.publish(os.getenv("GH_REVIEW_API_TOKEN"))
             self.nvim.out_write(f'{result}: {result.reason}\n')
         else:
             self.nvim.err_write("Cannot publish since no review is currently active.\n")
