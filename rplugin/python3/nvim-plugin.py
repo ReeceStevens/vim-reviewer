@@ -90,7 +90,6 @@ class TestPlugin(object):
             return current_buffer_path.replace(repository_root, '')
         return None
 
-    # TODO: View existing comments
     # TODO: Delete an existing comment
     # TODO: Add additional comments to an already-published review
 
