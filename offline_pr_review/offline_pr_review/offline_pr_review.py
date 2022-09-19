@@ -147,6 +147,14 @@ def get_review_file(pr_number: int) -> str:
     review_directory = get_review_directory()
     return os.path.join(review_directory, f"{pr_number}-review.json")
 
+def get_or_create_review(pr_number: int) -> Review:
+    review_file = get_review_file(pr_number)
+    if os.path.exists(review_file):
+        with open(review_file) as f:
+            return Review.deserialize(f.read())
+    else:
+        return new_blank_review(pr_number)
+
 
 def get_repo_from_config() -> Tuple[str, str]:
     config_path = get_config_file_path()
@@ -198,12 +206,14 @@ def add_comment(
 ):
     review = get_review(pull_request)
     review.add_comment(
-        body,
-        line,
-        path,
-        side,
-        start_line,
-        start_side,
+        Comment(
+            body,
+            line,
+            path,
+            side,
+            start_line,
+            start_side,
+        )
     )
     review.save()
 
