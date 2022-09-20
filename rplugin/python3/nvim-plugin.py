@@ -73,8 +73,7 @@ class TestPlugin(object):
         return self.review_active
 
     def repository_absolute_path(self) -> str:
-        git_dir_path = self.nvim.call('FugitiveGitDir')
-        return git_dir_path[:-len('.git')]
+        return self.nvim.call('FugitiveWorkTree')
 
     def current_buffer_path(self) -> Optional[str]:
         """
@@ -83,11 +82,10 @@ class TestPlugin(object):
         For example, a file called "test.py" within a parent directory called
         "project" would return the path `project/test.py`.
         """
-        git_dir_path = self.nvim.call('FugitiveGitDir')
+        repository_root = self.nvim.call('FugitiveWorkTree')
         current_buffer_path = self.nvim.current.buffer.name
-        if current_buffer_path.startswith('/') and git_dir_path:
-            repository_root = git_dir_path[:-len('.git')]
-            return current_buffer_path.replace(repository_root, '')
+        if current_buffer_path.startswith('/') and repository_root:
+            return current_buffer_path.replace(repository_root + '/', '')
         return None
 
     # TODO: Delete an existing comment
