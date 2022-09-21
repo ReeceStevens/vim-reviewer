@@ -204,3 +204,20 @@ class TestPlugin(object):
         self.in_progress_comment = comment_to_edit
         self.new_temporary_buffer(on_save_command='SaveComment existing')
         self.nvim.current.buffer[:] = self.in_progress_comment.body.split('\n')
+
+    @pynvim.command('DeleteComment', nargs="*", range="")
+    def delete_comment(self, args, range):
+        """
+        Delete the comment for the line under the cursor, if one exists.
+        """
+        path = self.current_buffer_path()
+        if path is None:
+            self.nvim.err_write("Current buffer is not a valid path in the git repository.\n")
+            return
+        comment_to_delete = self.review.get_comment_at_position(path, range[0])
+        if comment_to_delete is None:
+            self.nvim.err_write("No comment under the cursor.\n")
+            return
+
+        self.review.delete_comment(comment_to_delete)
+        self.nvim.out_write("Comment deleted.\n")

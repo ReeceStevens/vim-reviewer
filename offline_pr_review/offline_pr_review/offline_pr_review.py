@@ -122,6 +122,10 @@ class Review:
             return eligible_comments[0]
         return None
 
+    def delete_comment(self, comment: Comment):
+        self.comments = list(filter(lambda c: c != comment, self.comments))
+        self.save()
+
 
 def get_review_directory() -> str:
     """
