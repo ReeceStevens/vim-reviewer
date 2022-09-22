@@ -5,6 +5,7 @@ from tempfile import NamedTemporaryFile
 import pynvim
 import offline_pr_review
 
+MAX_QF_BODY_LENGTH=50
 
 @pynvim.plugin
 class TestPlugin(object):
@@ -224,3 +225,11 @@ class TestPlugin(object):
         self.review.delete_comment(comment_to_delete)
         self.nvim.out_write("Comment deleted.\n")
         self.update_signs()
+
+    @pynvim.command('QuickfixAllComments')
+    def quickfix_all_comments(self):
+        comment_dictionaries = [
+            {'filename': c.path, 'lnum': c.line, 'text': c.body[:MAX_QF_BODY_LENGTH]}
+            for c in self.review.comments
+        ]
+        self.nvim.call("setqflist", comment_dictionaries, ' ')
