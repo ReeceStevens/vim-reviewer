@@ -133,11 +133,12 @@ class TestPlugin(object):
         if path is None:
             self.nvim.err_write("Current buffer is not a valid path in the git repository.\n")
             return
+        multi_line = range[0] != range[1]
         self.in_progress_comment = offline_pr_review.Comment(
             body="",
             path=path,
             line=range[1],
-            start_line=range[0],
+            start_line=range[0] if multi_line else range[0] - 1,
             # TODO: eventually get better side detection from buffer names
             side='RIGHT',
             start_side='RIGHT'
