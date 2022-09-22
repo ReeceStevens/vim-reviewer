@@ -69,6 +69,7 @@ class TestPlugin(object):
                 result.raise_for_status()
             except Exception as e:
                 self.nvim.err_write(f'{result.text}\n')
+            self.update_signs()
         else:
             self.nvim.err_write("Cannot publish since no review is currently active.\n")
 
@@ -221,3 +222,4 @@ class TestPlugin(object):
 
         self.review.delete_comment(comment_to_delete)
         self.nvim.out_write("Comment deleted.\n")
+        self.update_signs()
