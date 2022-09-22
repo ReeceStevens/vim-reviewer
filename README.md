@@ -17,6 +17,9 @@ This plugin requires:
 1. `neovim`
 2. `vim-fugitive`
 
+Within the plugin is a Python module that depends on the `requests` python
+package.
+
 ## Installation
 
 _Note: this install process is not ideal due to all the little details of
