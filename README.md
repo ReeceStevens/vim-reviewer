@@ -10,6 +10,10 @@ _can_ currently use it to do PR reviews.
 **This plugin's development was started as a part of [Innolitics 10x
 Time](https://innolitics.com/10x/time/)**
 
+## Demo
+
+https://user-images.githubusercontent.com/5847947/193730037-616d7b20-2d34-430f-a680-a23e50bea87f.mov
+
 ## Dependencies
 
 This plugin requires:
