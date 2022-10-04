@@ -94,7 +94,6 @@ class TestPlugin(object):
             return current_buffer_path.replace(repository_root + '/', '')
         return None
 
-    # TODO: Delete an existing comment
     # TODO: Add additional comments to an already-published review
 
     def new_temporary_buffer(self, on_save_command: Optional[str] = None):
@@ -112,7 +111,7 @@ class TestPlugin(object):
             if on_save_command:
                 # Set the on-save behavior for this buffer. This uses the buffer-local
                 # autocommands feature.
-                self.nvim.command(f'autocmd BufWritePre <buffer> :{on_save_command}')
+                self.nvim.command(f'autocmd BufWritePost <buffer> :{on_save_command}')
 
     def current_buffer_contents(self) -> str:
         buffer_contents = self.nvim.current.buffer[:]
@@ -152,7 +151,7 @@ class TestPlugin(object):
         """
         Save the contents of the comment buffer to disk.
 
-        This command is set to be triggered on `BufWritePre` for the comment
+        This command is set to be triggered on `BufWritePost` for the comment
         buffer (e.g., on every write).
 
         Note that this command _must_ be `sync=True`, otherwise the buffer
@@ -179,7 +178,7 @@ class TestPlugin(object):
         """
         Save the contents of the review body buffer to disk.
 
-        This command is set to be triggered on `BufWritePre` for the review body
+        This command is set to be triggered on `BufWritePost` for the review body
         buffer (e.g., on every write).
 
         Note that this command _must_ be `sync=True`, otherwise the buffer
