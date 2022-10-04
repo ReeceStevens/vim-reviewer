@@ -6,8 +6,9 @@ extern crate tempfile;
 
 use git2::Repository;
 use nvim_oxi::api;
-use nvim_oxi::opts::CreateCommandOpts;
-use nvim_oxi::types::{CommandArgs, CommandNArgs, CommandRange};
+use nvim_oxi::api::Buffer;
+use nvim_oxi::api::opts::CreateCommandOpts;
+use nvim_oxi::api::types::{CommandArgs, CommandNArgs, CommandRange};
 use nvim_oxi::{self as oxi, Array, Dictionary};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
@@ -26,7 +27,7 @@ macro_rules! create_command {
             .nargs($nargs)
             .range(CommandRange::CurrentLine)
             .build();
-        api::create_user_command($name, $fn, Some(&opts))?;
+        api::create_user_command($name, $fn, &opts)?;
     };
 }
 
@@ -52,15 +53,18 @@ fn vim_reviewer() -> oxi::Result<()> {
         "UpdateReviewSigns",
         "Update the gutter symbols for review comments",
         CommandNArgs::ZeroOrOne,
-        |args: CommandArgs| -> oxi::Result<()> {
+        |args: CommandArgs| -> oxi::api::Result<()> {
             let review = get_current_review();
             match review {
                 None => return Ok(()),
                 Some(review) => {
                     let mut sign_idx = 0;
                     api::command("sign unplace * group=PrReviewSigns")?;
+                    api::out_write(format!("{:?}\n", api::list_bufs().collect::<Vec<Buffer>>()));
                     for buffer in api::list_bufs() {
+                        api::out_write(format!("{}\n", buffer));
                         let buffer_path = get_current_buffer_path()?;
+                        api::out_write(format!("{}\n", buffer_path.display()));
                         let comments_in_buffer: Vec<&Comment> = review
                             .comments
                             .iter()
@@ -93,7 +97,7 @@ fn vim_reviewer() -> oxi::Result<()> {
         "StartReview",
         "Start a review",
         CommandNArgs::ZeroOrOne,
-        |args: CommandArgs| -> oxi::Result<()> {
+        |args: CommandArgs| -> oxi::api::Result<()> {
             let mut config = get_config_from_file();
             config.active_pr = Some(str::parse::<u32>(&args.args.unwrap()).unwrap());
             update_configuration(config);
@@ -105,7 +109,7 @@ fn vim_reviewer() -> oxi::Result<()> {
         "PublishReview",
         "Publish a review to GitHub",
         CommandNArgs::ZeroOrOne,
-        |args: CommandArgs| -> oxi::Result<()> {
+        |args: CommandArgs| -> oxi::api::Result<()> {
             let review = get_current_review();
             match review {
                 Some(review) => {
@@ -127,7 +131,7 @@ fn vim_reviewer() -> oxi::Result<()> {
         "ReviewComment",
         "Add a review comment",
         CommandNArgs::ZeroOrOne,
-        |args: CommandArgs| -> oxi::Result<()> {
+        |args: CommandArgs| -> oxi::api::Result<()> {
             let review = get_current_review();
             match review {
                 None => {
@@ -165,7 +169,7 @@ fn vim_reviewer() -> oxi::Result<()> {
         "SaveComment",
         "Save an in-progress review comment",
         CommandNArgs::ZeroOrOne,
-        |args: CommandArgs| -> oxi::Result<()> {
+        |args: CommandArgs| -> oxi::api::Result<()> {
             let is_new_comment = args.args.unwrap_or("".to_string()) == "new".to_string();
             let review = get_current_review();
             match review {
@@ -196,7 +200,7 @@ fn vim_reviewer() -> oxi::Result<()> {
         "ReviewBody",
         "Edit the body text of the review",
         CommandNArgs::ZeroOrOne,
-        |_args: CommandArgs| -> oxi::Result<()> {
+        |_args: CommandArgs| -> oxi::api::Result<()> {
             let review = get_current_review();
             match review {
                 None => {
@@ -215,7 +219,7 @@ fn vim_reviewer() -> oxi::Result<()> {
         "SaveReviewBody",
         "Save the buffer contents to the review body",
         CommandNArgs::ZeroOrOne,
-        |_args: CommandArgs| -> oxi::Result<()> {
+        |_args: CommandArgs| -> oxi::api::Result<()> {
             let review = get_current_review();
             match review {
                 None => {
@@ -235,7 +239,7 @@ fn vim_reviewer() -> oxi::Result<()> {
         "EditComment",
         "Save the buffer contents to the review body",
         CommandNArgs::ZeroOrOne,
-        |args: CommandArgs| -> oxi::Result<()> {
+        |args: CommandArgs| -> oxi::api::Result<()> {
             let path = get_current_buffer_path()?;
             let review = get_current_review();
             match review {
@@ -270,7 +274,7 @@ fn vim_reviewer() -> oxi::Result<()> {
         "DeleteComment",
         "Delete the comment under the cursor, if one exists.",
         CommandNArgs::ZeroOrOne,
-        |args: CommandArgs| -> oxi::Result<()> {
+        |args: CommandArgs| -> oxi::api::Result<()> {
             let path = get_current_buffer_path()?;
             let review = get_current_review();
             match review {
@@ -305,7 +309,7 @@ fn vim_reviewer() -> oxi::Result<()> {
         "QuickfixAllComments",
         "Load all review comments into the quickfix list",
         CommandNArgs::ZeroOrOne,
-        |args: CommandArgs| -> oxi::Result<()> {
+        |args: CommandArgs| -> oxi::api::Result<()> {
             let review = get_current_review();
             match review {
                 None => {
@@ -344,7 +348,7 @@ fn get_current_review() -> Option<Review> {
 
 /// Open a new temporary buffer. If `on_save_command` is specified, run the command on BufWritePre
 /// on the new buffer.
-fn new_temporary_buffer(on_save_command: Option<&str>) -> nvim_oxi::Result<()> {
+fn new_temporary_buffer(on_save_command: Option<&str>) -> nvim_oxi::api::Result<()> {
     let file = NamedTempFile::new().unwrap();
     api::command(&format!("sp {}", file.path().display()))?;
     api::command("set ft=markdown")?;
@@ -358,7 +362,7 @@ fn new_temporary_buffer(on_save_command: Option<&str>) -> nvim_oxi::Result<()> {
 }
 
 /// Return a string containing all the text within the current buffer
-fn get_text_from_current_buffer() -> nvim_oxi::Result<String> {
+fn get_text_from_current_buffer() -> nvim_oxi::api::Result<String> {
     Ok(api::get_current_buf()
         .get_lines(0, 10000000, false)?
         .map(|s| s.to_string())
@@ -367,7 +371,7 @@ fn get_text_from_current_buffer() -> nvim_oxi::Result<String> {
 }
 
 /// Get the relative path in the repository for the file open in the current buffer.
-fn get_current_buffer_path() -> nvim_oxi::Result<PathBuf> {
+fn get_current_buffer_path() -> nvim_oxi::api::Result<PathBuf> {
     let repo = Repository::open_from_env().unwrap();
     let workdir = repo.workdir().unwrap();
     let current_buffer = api::get_current_buf();
@@ -379,16 +383,17 @@ fn get_current_buffer_path() -> nvim_oxi::Result<PathBuf> {
                 "Current buffer is not a valid path in the git repository: {}",
                 e
             ));
-            Err(nvim_oxi::Error::Other(
-                "Current buffer not a valid path in the repository".to_string(),
-            ))
+            panic!(); // TODO: better error handling
+            // Err(nvim_oxi::Error::Other(
+            //     "Current buffer not a valid path in the repository".to_string(),
+            // ))
         }
         Ok(path) => Ok(path.to_path_buf()),
     }
 }
 
 /// Set the provided text as the contents of the current buffer
-fn set_text_in_buffer(text: String) -> nvim_oxi::Result<()> {
+fn set_text_in_buffer(text: String) -> nvim_oxi::api::Result<()> {
     let mut buffer = api::get_current_buf();
     buffer.set_lines(0, 10000000, false, text.split("\n"))?;
     Ok(())
@@ -611,7 +616,7 @@ pub fn update_configuration(config: Config) {
     let config_file_path = get_config_file_path();
     if config_file_path.exists() {
         // TODO: find better way to manage this warning. Or is it even necessary?
-        println!("Warning: overwriting existing configuration.");
+        api::out_write("Warning: overwriting existing configuration.\n");
     }
     let mut file = match File::create(&config_file_path) {
         Err(err) => panic!("Error creating {}: {}", config_file_path.display(), err),

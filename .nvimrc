@@ -3,7 +3,7 @@ let &runtimepath.=','.escape(expand('<sfile>:p:h'), '\,')
 
 lua << EOF
 
--- require("vim_reviewer");
+require("vim_reviewer");
 
 EOF
 
