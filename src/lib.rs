@@ -9,7 +9,7 @@ use nvim_oxi::api;
 use nvim_oxi::api::Buffer;
 use nvim_oxi::api::opts::CreateCommandOpts;
 use nvim_oxi::api::types::{CommandArgs, CommandNArgs, CommandRange};
-use nvim_oxi::{self as oxi, Array, Dictionary};
+use nvim_oxi::{self as oxi, Array, Dictionary, Object};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
@@ -376,19 +376,18 @@ fn vim_reviewer() -> oxi::Result<()> {
                         .iter()
                         .map(|comment| {
                             Dictionary::from_iter([
-                                ("filename", comment.path.clone()),
-                                ("lnum", comment.line.to_string()),
-                                ("text", comment.body.clone()),
+                                ("filename", Object::from(comment.path.clone())),
+                                ("lnum", Object::from(comment.line)),
+                                ("text", Object::from(comment.body.clone())),
                             ])
                         })
                         .collect();
-                    api::call_function::<Array, ()>("setqflist", comments)?;
+                    api::call_function::<_, i32>("setqflist", (comments, " "))?;
                     Ok(())
                 }
             }
         }
     );
-
     Ok(())
 }
 
