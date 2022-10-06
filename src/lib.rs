@@ -31,22 +31,59 @@ macro_rules! create_command {
     };
 }
 
+/// Based on the remote URL, parse out the repository name and owner.
+///
+/// TODO: Currently, this assumes an SSH-formatted remote URL, such as
+/// git@github.com:reecestevens/vim-reviewer.
+///
+/// Future work: this function can be used to determine which git backend is used (GitHub, GitLab,
+/// etc)
+fn parse_config_from_url(url: &str) -> Result<(String, String), String> {
+    let repository_info = url.split(":").last();
+    let results = match repository_info {
+        Some(info) => info.split("/").collect::<Vec<&str>>(),
+        None => return Err("Invalid repository url".to_string()),
+    };
+    Ok((results[0].to_string(), results[1].to_string().replace(".git", "")))
+}
+
+/// Update the repository configuration based on the current origin remote
+fn update_config_from_remote() -> oxi::Result<()> {
+    let repo = match Repository::open(env::current_dir().unwrap()) {
+        Ok(repo) => repo,
+        Err(e) => {
+            api::err_writeln(&format!("Current directory is not a git repository: {}", e));
+            return Ok(());
+        }
+    };
+    let remote_url = match repo.find_remote("origin") {
+        Ok(remote) => remote.url().unwrap().to_string(),
+        Err(e) => {
+            api::err_writeln(&format!("Failed to find remote 'origin': {}", e));
+            return Ok(());
+        }
+    };
+    let (owner, repo) = match parse_config_from_url(&remote_url) {
+        Ok(results) => results,
+        Err(_) => {
+            api::err_writeln("Failed to parse repository information from remote URL");
+            return Ok(());
+        }
+    };
+
+    update_configuration(Config {
+        owner,
+        repo,
+        active_pr: None,
+    });
+
+    Ok(())
+}
+
 #[oxi::module]
 fn vim_reviewer() -> oxi::Result<()> {
-    // TODO: work out better handling for this `review` global.
-    // static mut REVIEW: Box<Option<Review>> = Box::new(None);
-    // static mut IN_PROGRESS_COMMENT: Option<Comment> = None;
+    update_config_from_remote()?;
 
-    // let repo = match Repository::open(env::current_dir().unwrap()) {
-    //     Ok(repo) => repo,
-    //     Err(e) => {
-    //         api::err_writeln(&format!("Current directory is not a git repository: {}", e));
-    //         unimplemented!() // TODO: Determine better errror return
-    //     }
-    // };
-
-    // let remote_info = api::call_function("FugitiveRemote", vec![]).unwrap();
-    // TODO: Update configuration based on remote settings
     api::command("sign define PrReviewComment text=C> texthl=Search linehl=DiffText")?;
 
     create_command!(
