@@ -113,9 +113,26 @@ fn vim_reviewer() -> oxi::Result<()> {
             let review = get_current_review();
             match review {
                 Some(review) => {
-                    review
-                        .publish(env::var("GH_REVIEW_API_TOKEN").unwrap())
-                        .unwrap();
+                    let token = match env::var("GH_REVIEW_API_TOKEN") {
+                        Ok(token) => token,
+                        Err(e) => {
+                            api::err_writeln(&format!("GH_REVIEW_API_TOKEN environment variable not set: {}", e));
+                            return Ok(());
+                        }
+                    };
+                    match review.publish(token) {
+                        Ok(response) => {
+                            let status = response.status();
+                            if status.is_success() {
+                                api::out_write("Review published successfully\n");
+                            } else {
+                                api::err_writeln(&format!("Failed to publish review ({:?}): {:?}", status, response.text()));
+                            }
+                        },
+                        Err(error) => {
+                            api::err_writeln(&format!("Failed to publish review due to error: {}", error));
+                        }
+                    };
                     // TODO: Cleanup of current review
                     // update_signs();
                 }
