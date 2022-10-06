@@ -10,7 +10,7 @@ use nvim_oxi::api::Buffer;
 use nvim_oxi::api::opts::CreateCommandOpts;
 use nvim_oxi::api::types::{CommandArgs, CommandNArgs, CommandRange};
 use nvim_oxi::{self as oxi, Array, Dictionary};
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION};
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
@@ -490,6 +490,10 @@ impl Review {
                 AUTHORIZATION,
                 HeaderValue::from_str(&format!("token {}", token)).unwrap(),
             );
+            headers.insert(
+                USER_AGENT,
+                HeaderValue::from_static("vim-reviewer"),
+            );
             headers
         }
         client
@@ -614,10 +618,6 @@ fn get_config_from_file() -> Config {
 
 pub fn update_configuration(config: Config) {
     let config_file_path = get_config_file_path();
-    if config_file_path.exists() {
-        // TODO: find better way to manage this warning. Or is it even necessary?
-        api::out_write("Warning: overwriting existing configuration.\n");
-    }
     let mut file = match File::create(&config_file_path) {
         Err(err) => panic!("Error creating {}: {}", config_file_path.display(), err),
         Ok(file) => file,
