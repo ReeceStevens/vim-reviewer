@@ -7,8 +7,8 @@ extern crate tempfile;
 use git2::Repository;
 use nvim_oxi::api;
 use nvim_oxi::api::Buffer;
-use nvim_oxi::api::opts::CreateCommandOpts;
-use nvim_oxi::api::types::{CommandArgs, CommandNArgs, CommandRange};
+use nvim_oxi::api::opts::{CreateCommandOpts, CmdOpts};
+use nvim_oxi::api::types::{CommandArgs, CommandNArgs, CommandRange, CmdInfos};
 use nvim_oxi::{self as oxi, Array, Dictionary, Object};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,8 @@ macro_rules! create_command {
         api::create_user_command($name, $fn, &opts)?;
     };
 }
+
+type ApiResult<T> = std::result::Result<T, api::Error>;
 
 /// Based on the remote URL, parse out the repository name and owner.
 ///
@@ -80,6 +82,8 @@ fn update_config_from_remote() -> oxi::Result<()> {
     Ok(())
 }
 
+
+
 #[oxi::module]
 fn vim_reviewer() -> oxi::Result<()> {
     update_config_from_remote()?;
@@ -90,17 +94,23 @@ fn vim_reviewer() -> oxi::Result<()> {
         "UpdateReviewSigns",
         "Update the gutter symbols for review comments",
         CommandNArgs::ZeroOrOne,
-        |args: CommandArgs| -> oxi::api::Result<()> {
+        |args: CommandArgs| {
             let review = get_current_review();
             match review {
                 None => return Ok(()),
                 Some(review) => {
                     let mut sign_idx = 0;
                     api::command("sign unplace * group=PrReviewSigns")?;
-                    api::out_write(format!("{:?}\n", api::list_bufs().collect::<Vec<Buffer>>()));
-                    for buffer in api::list_bufs() {
+                    api::out_write(format!("Buffers: {:?}\n", api::list_bufs().collect::<Vec<Buffer>>()));
+                    let buffers = api::list_bufs();
+                    for buffer in buffers {
+                        unsafe {
                         api::out_write(format!("{}\n", buffer));
                         let buffer_path = get_current_buffer_path()?;
+
+                        let obj: oxi::Object = (&buffer).into();
+                        let handle = obj.as_integer_unchecked();
+
                         api::out_write(format!("{}\n", buffer_path.display()));
                         let comments_in_buffer: Vec<&Comment> = review
                             .comments
@@ -112,17 +122,20 @@ fn vim_reviewer() -> oxi::Result<()> {
                         for comment in comments_in_buffer {
                             let start_line = comment.start_line.unwrap_or(comment.line);
                             let end_line = comment.line;
+                            api::out_write(format!("{:?}: {}-{}\n", buffer, start_line, end_line));
                             for line in start_line..=end_line {
                                 sign_idx += 1;
-                                api::command(&format!(
-                                    "sign place {} line={} name=PrReviewComment group=PrReviewSigns file={}",
+                                let command = format!(
+                                    "sign place {} line={} name=PrReviewComment group=PrReviewSigns buffer={}",
                                     sign_idx,
                                     line,
-                                    buffer.get_name().unwrap().display()
-                                ))
-                                .unwrap();
+                                    handle,
+                                );
+                                api::out_write(format!("{}\n", &command));
+                                // api::command(&command)?;
                             }
                         }
+                    }
                     }
                     Ok(())
                 }
@@ -134,7 +147,7 @@ fn vim_reviewer() -> oxi::Result<()> {
         "StartReview",
         "Start a review",
         CommandNArgs::ZeroOrOne,
-        |args: CommandArgs| -> oxi::api::Result<()> {
+        |args: CommandArgs| {
             let mut config = get_config_from_file();
             config.active_pr = Some(str::parse::<u32>(&args.args.unwrap()).unwrap());
             update_configuration(config);
@@ -146,7 +159,7 @@ fn vim_reviewer() -> oxi::Result<()> {
         "PublishReview",
         "Publish a review to GitHub",
         CommandNArgs::ZeroOrOne,
-        |args: CommandArgs| -> oxi::api::Result<()> {
+        |args: CommandArgs| {
             let review = get_current_review();
             match review {
                 Some(review) => {
@@ -185,7 +198,7 @@ fn vim_reviewer() -> oxi::Result<()> {
         "ReviewComment",
         "Add a review comment",
         CommandNArgs::ZeroOrOne,
-        |args: CommandArgs| -> oxi::api::Result<()> {
+        |args: CommandArgs| {
             let review = get_current_review();
             match review {
                 None => {
@@ -206,7 +219,8 @@ fn vim_reviewer() -> oxi::Result<()> {
                         Some(if multi_line {
                             args.line1 as u32
                         } else {
-                            (args.line1 - 1) as u32
+                            // (args.line1 - 1) as u32
+                            1
                         }),
                         Some(Side::RIGHT),
                     ));
@@ -223,29 +237,31 @@ fn vim_reviewer() -> oxi::Result<()> {
         "SaveComment",
         "Save an in-progress review comment",
         CommandNArgs::ZeroOrOne,
-        |args: CommandArgs| -> oxi::api::Result<()> {
+        |args: CommandArgs| {
+            // let is_new_comment = args.args;
             let is_new_comment = args.args.unwrap_or("".to_string()) == "new".to_string();
-            let review = get_current_review();
-            match review {
-                None => {
-                    api::err_writeln("No in-progress review");
-                }
-                Some(mut review) => {
-                    match review.in_progress_comment {
-                        Some(mut comment) => {
-                            comment.body = get_text_from_current_buffer()?;
-                            review.in_progress_comment = None;
-                            if is_new_comment {
-                                review.add_comment(comment.clone());
-                            }
-                            review.save();
-                        }
-                        None => {
-                            api::err_writeln("No in-progress comment to save.");
-                        }
-                    };
-                }
-            }
+            // let review = get_current_review();
+            // match review {
+            //     None => {
+            //         api::err_writeln("No in-progress review");
+            //     }
+            //     Some(mut review) => {
+            //         match review.in_progress_comment {
+            //             Some(mut comment) => {
+            //                 comment.body = get_text_from_current_buffer()?;
+            //                 review.in_progress_comment = None;
+            //                 if is_new_comment {
+            //                     review.add_comment(comment.clone());
+            //                 }
+            //                 // TODO: else update existing comment
+            //                 review.save();
+            //             }
+            //             None => {
+            //                 api::err_writeln("No in-progress comment to save.");
+            //             }
+            //         };
+            //     }
+            // }
             Ok(())
         }
     );
@@ -254,7 +270,7 @@ fn vim_reviewer() -> oxi::Result<()> {
         "ReviewBody",
         "Edit the body text of the review",
         CommandNArgs::ZeroOrOne,
-        |_args: CommandArgs| -> oxi::api::Result<()> {
+        |_args: CommandArgs| {
             let review = get_current_review();
             match review {
                 None => {
@@ -273,7 +289,7 @@ fn vim_reviewer() -> oxi::Result<()> {
         "SaveReviewBody",
         "Save the buffer contents to the review body",
         CommandNArgs::ZeroOrOne,
-        |_args: CommandArgs| -> oxi::api::Result<()> {
+        |_args: CommandArgs| {
             let review = get_current_review();
             match review {
                 None => {
@@ -293,7 +309,7 @@ fn vim_reviewer() -> oxi::Result<()> {
         "EditComment",
         "Save the buffer contents to the review body",
         CommandNArgs::ZeroOrOne,
-        |args: CommandArgs| -> oxi::api::Result<()> {
+        |args: CommandArgs| {
             let path = get_current_buffer_path()?;
             let review = get_current_review();
             match review {
@@ -301,7 +317,7 @@ fn vim_reviewer() -> oxi::Result<()> {
                     api::err_writeln("No review is currently active.");
                     Ok(())
                 }
-                Some(review) => {
+                Some(mut review) => {
                     let comment_to_edit = review.get_comment_at_position(
                         path.to_str().unwrap().to_string(),
                         args.line1 as u32,
@@ -316,6 +332,8 @@ fn vim_reviewer() -> oxi::Result<()> {
                             // TODO: in progress comment management
                             new_temporary_buffer(Some("SaveComment existing"))?;
                             set_text_in_buffer(comment.body.clone())?;
+                            review.in_progress_comment = Some(comment.clone());
+                            review.save();
                             Ok(())
                         }
                     }
@@ -328,7 +346,7 @@ fn vim_reviewer() -> oxi::Result<()> {
         "DeleteComment",
         "Delete the comment under the cursor, if one exists.",
         CommandNArgs::ZeroOrOne,
-        |args: CommandArgs| -> oxi::api::Result<()> {
+        |args: CommandArgs| {
             let path = get_current_buffer_path()?;
             let review = get_current_review();
             match review {
@@ -363,7 +381,7 @@ fn vim_reviewer() -> oxi::Result<()> {
         "QuickfixAllComments",
         "Load all review comments into the quickfix list",
         CommandNArgs::ZeroOrOne,
-        |args: CommandArgs| -> oxi::api::Result<()> {
+        |args: CommandArgs| {
             let review = get_current_review();
             match review {
                 None => {
@@ -401,8 +419,9 @@ fn get_current_review() -> Option<Review> {
 
 /// Open a new temporary buffer. If `on_save_command` is specified, run the command on BufWritePre
 /// on the new buffer.
-fn new_temporary_buffer(on_save_command: Option<&str>) -> nvim_oxi::api::Result<()> {
+fn new_temporary_buffer(on_save_command: Option<&str>) -> ApiResult<()> {
     let file = NamedTempFile::new().unwrap();
+    api::out_write(format!("{}\n", file.path().display()));
     api::command(&format!("sp {}", file.path().display()))?;
     api::command("set ft=markdown")?;
     if on_save_command.is_some() {
@@ -415,16 +434,16 @@ fn new_temporary_buffer(on_save_command: Option<&str>) -> nvim_oxi::api::Result<
 }
 
 /// Return a string containing all the text within the current buffer
-fn get_text_from_current_buffer() -> nvim_oxi::api::Result<String> {
+fn get_text_from_current_buffer() -> ApiResult<String> {
     Ok(api::get_current_buf()
-        .get_lines(0, 10000000, false)?
+        .get_lines(0..10000000, false)?
         .map(|s| s.to_string())
         .collect::<Vec<String>>()
         .join("\n"))
 }
 
 /// Get the relative path in the repository for the file open in the current buffer.
-fn get_current_buffer_path() -> nvim_oxi::api::Result<PathBuf> {
+fn get_current_buffer_path() -> ApiResult<PathBuf> {
     let repo = Repository::open_from_env().unwrap();
     let workdir = repo.workdir().unwrap();
     let current_buffer = api::get_current_buf();
@@ -436,19 +455,41 @@ fn get_current_buffer_path() -> nvim_oxi::api::Result<PathBuf> {
                 "Current buffer is not a valid path in the git repository: {}",
                 e
             ));
-            panic!(); // TODO: better error handling
-            // Err(nvim_oxi::Error::Other(
-            //     "Current buffer not a valid path in the repository".to_string(),
-            // ))
+            Err(api::Error::Other(
+                "Current buffer not a valid path in the repository".to_string(),
+            ))
         }
         Ok(path) => Ok(path.to_path_buf()),
     }
 }
 
+#[oxi::test]
+fn test_current_buffer_path() {
+    api::command("e src/lib.rs").unwrap();
+    assert_eq!(get_current_buffer_path(), Ok(Path::new("src/lib.rs").to_path_buf()));
+}
+
+#[oxi::test]
+fn test_leave_two_comments() {
+    vim_reviewer().unwrap();
+    api::command("e src/lib.rs").unwrap();
+    api::command("StartReview 101").unwrap();
+    let opts = CmdOpts::builder().output(true).build();
+    let info = CmdInfos::builder().cmd("ReviewComment").range(api::types::CmdRange::Double(25, 28)).build();
+    // api::command("25,28ReviewComment").unwrap();
+    api::cmd(&info, &opts).unwrap();
+    api::feedkeys("Test.", api::types::Mode::Insert, false);
+    // api::command("w").unwrap();
+    // api::command("50").unwrap();
+    // api::command("ReviewComment").unwrap();
+    // api::command("wq").unwrap();
+}
+
+
 /// Set the provided text as the contents of the current buffer
-fn set_text_in_buffer(text: String) -> nvim_oxi::api::Result<()> {
+fn set_text_in_buffer(text: String) -> ApiResult<()> {
     let mut buffer = api::get_current_buf();
-    buffer.set_lines(0, 10000000, false, text.split("\n"))?;
+    buffer.set_lines(0..10000000, false, text.split("\n"))?;
     Ok(())
 }
 

@@ -12,8 +12,9 @@ git2 = "0.15.0"
 tempfile = "3.3.0"
 
 [dependencies.nvim-oxi]
+# version = "0.2.2"
 git = "https://github.com/noib3/nvim-oxi"
-features = ["neovim-0-8"]
+features = ["neovim-0-8", "test"]
 
 
 [dependencies.reqwest]
