@@ -5,7 +5,7 @@ from tempfile import NamedTemporaryFile
 import pynvim
 import offline_pr_review
 
-MAX_QF_BODY_LENGTH=50
+MAX_QF_BODY_LENGTH = 500
 
 @pynvim.plugin
 class TestPlugin(object):
