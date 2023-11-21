@@ -1,3 +1,4 @@
+import re
 import os
 from typing import Optional
 from tempfile import NamedTemporaryFile
@@ -81,6 +82,10 @@ class TestPlugin(object):
     def repository_absolute_path(self) -> str:
         return self.nvim.call('FugitiveWorkTree')
 
+    def current_buffer_is_prior_rev(self) -> bool:
+        current_buffer_path = self.nvim.current.buffer.name
+        return current_buffer_path.startswith("fugitive://")
+
     def current_buffer_path(self) -> Optional[str]:
         """
         Return the buffer's current path in the git repository, or None if it does not exist.
@@ -89,10 +94,15 @@ class TestPlugin(object):
         "project" would return the path `project/test.py`.
         """
         repository_root = self.nvim.call('FugitiveWorkTree')
+        worktree_path_re = re.compile(r'.*/.git.*[a-f0-9]{40}/(.*)')
         current_buffer_path = self.nvim.current.buffer.name
         if current_buffer_path.startswith('/') and repository_root:
             return current_buffer_path.replace(repository_root + '/', '')
+        elif self.current_buffer_is_prior_rev():
+            matches = re.match(worktree_path_re, current_buffer_path)
+            return matches.group(1)
         return None
+
 
     # TODO: Add additional comments to an already-published review
 
@@ -130,6 +140,7 @@ class TestPlugin(object):
             return
 
         path = self.current_buffer_path()
+        prior_rev = self.current_buffer_is_prior_rev()
         if path is None:
             self.nvim.err_write("Current buffer is not a valid path in the git repository.\n")
             return
@@ -140,8 +151,8 @@ class TestPlugin(object):
             line=range[1],
             start_line=range[0] if multi_line else range[0] - 1,
             # TODO: eventually get better side detection from buffer names
-            side='RIGHT',
-            start_side='RIGHT'
+            side='LEFT' if prior_rev else 'RIGHT',
+            start_side='LEFT' if prior_rev else 'RIGHT'
         )
         self.new_temporary_buffer(on_save_command='SaveComment new')
 
