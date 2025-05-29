@@ -1,7 +1,7 @@
 [package]
 name = "vim-reviewer"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -12,9 +12,9 @@ git2 = "0.15.0"
 tempfile = "3.3.0"
 
 [dependencies.nvim-oxi]
-# version = "0.2.2"
-git = "https://github.com/noib3/nvim-oxi"
-features = ["neovim-0-8", "test"]
+version = "0.6.0"
+# git = "https://github.com/noib3/nvim-oxi"
+features = ["neovim-0-11", "test"]
 
 
 [dependencies.reqwest]

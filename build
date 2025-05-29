@@ -1,0 +1,4 @@
+#! /usr/bin/env bash
+
+cargo build
+cp ./target/debug/libvim_reviewer.dylib ./lua/vim_reviewer.so
