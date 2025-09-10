@@ -105,7 +105,7 @@ fn vim_reviewer() -> oxi::Result<()> {
                     let buffers = api::list_bufs();
                     for buffer in buffers {
                         unsafe {
-                            let buffer_path = get_current_buffer_path()?;
+                            let (_side, buffer_path) = get_current_buffer_path()?;
 
                             let obj: oxi::Object = (&buffer).into();
                             let handle = obj.as_integer_unchecked();
@@ -219,20 +219,19 @@ fn vim_reviewer() -> oxi::Result<()> {
                         api::err_writeln("A review comment is already being edited.");
                         return Ok(());
                     }
-                    let path = get_current_buffer_path()?;
+                    let (side, path) = get_current_buffer_path()?;
                     let multi_line = args.line1 != args.line2;
                     review.in_progress_comment = Some(Comment::new(
                         "".to_string(),
                         args.line2 as u32,
                         path.to_str().unwrap().to_string(),
-                        Side::RIGHT,
+                        side,
                         Some(if multi_line {
                             args.line1 as u32
                         } else {
-                            // (args.line1 - 1) as u32
-                            1
+                            (args.line1 - 1) as u32
                         }),
-                        Some(Side::RIGHT),
+                        Some(side),
                     ));
                     review.save();
                     new_temporary_buffer(Some("SaveComment new"))?;
@@ -323,7 +322,7 @@ fn vim_reviewer() -> oxi::Result<()> {
         "Save the buffer contents to the review body",
         CommandNArgs::ZeroOrOne,
         |args: CommandArgs| -> ApiResult<()> {
-            let path = get_current_buffer_path()?;
+            let (_side, path) = get_current_buffer_path()?;
             let review = get_current_review();
             match review {
                 None => {
@@ -360,7 +359,7 @@ fn vim_reviewer() -> oxi::Result<()> {
         "Delete the comment under the cursor, if one exists.",
         CommandNArgs::ZeroOrOne,
         |args: CommandArgs| -> ApiResult<()> {
-            let path = get_current_buffer_path()?;
+            let (_side, path) = get_current_buffer_path()?;
             let review = get_current_review();
             match review {
                 None => {
@@ -434,7 +433,6 @@ fn get_current_review() -> Option<Review> {
 /// on the new buffer.
 fn new_temporary_buffer(on_save_command: Option<&str>) -> ApiResult<()> {
     let file = NamedTempFile::new().unwrap();
-    // api::out_write(format!("{}\n", file.path().display()));
     api::command(&format!("sp {}", file.path().display()))?;
     api::command("set ft=markdown")?;
     if on_save_command.is_some() {
@@ -456,11 +454,12 @@ fn get_text_from_current_buffer() -> ApiResult<String> {
 }
 
 /// Get the relative path in the repository for the file open in the current buffer.
-fn get_current_buffer_path() -> ApiResult<PathBuf> {
+fn get_current_buffer_path() -> ApiResult<(Side, PathBuf)> {
     let repo = Repository::open_from_env().unwrap();
     let workdir = repo.workdir().unwrap();
     let current_buffer = api::get_current_buf();
     let buffer_path = current_buffer.get_name().unwrap();
+    let buffer_is_prior_rev = buffer_path.starts_with("fugitive://");
 
     match buffer_path.strip_prefix(workdir) {
         Err(e) => {
@@ -472,7 +471,7 @@ fn get_current_buffer_path() -> ApiResult<PathBuf> {
                 "Current buffer not a valid path in the repository".to_string(),
             ))
         }
-        Ok(path) => Ok(path.to_path_buf()),
+        Ok(path) => Ok((if buffer_is_prior_rev { Side::LEFT } else { Side::RIGHT }, path.to_path_buf())),
     }
 }
 
@@ -481,7 +480,7 @@ fn test_current_buffer_path() {
     api::command("e src/lib.rs").unwrap();
     assert_eq!(
         get_current_buffer_path(),
-        Ok(Path::new("src/lib.rs").to_path_buf())
+        Ok((Side::RIGHT, (Path::new("src/lib.rs").to_path_buf())))
     );
 }
 
@@ -518,7 +517,7 @@ pub struct Config {
     active_pr: Option<u32>,
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Clone, Copy)]
+#[derive(Serialize, Deserialize, PartialEq, Clone, Copy, Debug)]
 pub enum Side {
     RIGHT,
     LEFT,
