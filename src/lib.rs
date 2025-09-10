@@ -1,20 +1,20 @@
 extern crate git2;
 extern crate nvim_oxi;
+extern crate regex;
 extern crate reqwest;
 extern crate serde;
 extern crate tempfile;
-extern crate regex;
 
 use git2::Repository;
 use nvim_oxi::api;
-use nvim_oxi::string;
 use nvim_oxi::api::opts::{CmdOpts, CreateCommandOpts};
 use nvim_oxi::api::types::{CmdInfos, CommandArgs, CommandNArgs, CommandRange};
+use nvim_oxi::string;
 use nvim_oxi::{self as oxi, Array, Dictionary, Object};
+use regex::Regex;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
-use regex::Regex;
 
 use std::env;
 use std::fs::File;
@@ -123,9 +123,12 @@ fn vim_reviewer() -> oxi::Result<()> {
                             for comment in comments_in_buffer {
                                 let start_line = comment.start_line.unwrap_or(comment.line);
                                 let end_line = comment.line;
-                                api::out_write(
-                                    string!("{:?}: {}-{}\n", buffer, start_line, end_line),
-                                );
+                                api::out_write(string!(
+                                    "{:?}: {}-{}\n",
+                                    buffer,
+                                    start_line,
+                                    end_line
+                                ));
                                 for line in start_line..=end_line {
                                     sign_idx += 1;
                                     let command = format!(
@@ -150,10 +153,17 @@ fn vim_reviewer() -> oxi::Result<()> {
         "Start a review",
         CommandNArgs::ZeroOrOne,
         |args: CommandArgs| -> ApiResult<()> {
-            let mut config = get_config_from_file();
-            config.active_pr = Some(str::parse::<u32>(&args.args.unwrap()).unwrap());
-            update_configuration(config);
-            Ok(())
+            match get_config_from_file() {
+                None => {
+                    api::err_writeln("Could not read configuration file.");
+                    return Ok(());
+                },
+                Some(mut config) => {
+                    config.active_pr = Some(str::parse::<u32>(&args.args.unwrap()).unwrap());
+                    update_configuration(config);
+                    Ok(())
+                }
+            }
         }
     );
 
@@ -425,9 +435,9 @@ fn vim_reviewer() -> oxi::Result<()> {
 
 fn get_current_review() -> Option<Review> {
     let config = get_config_from_file();
-    match config.active_pr {
+    match config?.active_pr {
         None => None,
-        Some(pr_number) => Some(Review::get_review(pr_number)),
+        Some(pr_number) => Review::get_review(pr_number),
     }
 }
 
@@ -466,7 +476,12 @@ fn get_current_buffer_path() -> ApiResult<(Side, PathBuf)> {
         // Fugitive paths are of the form:
         // fugitive://<hash>/path/to/file
         let re = Regex::new(r".*/.git.*[a-f0-9]{40}/(.*)").unwrap();
-        let path = re.captures(buffer_path.to_str().unwrap()).unwrap().get(1).unwrap().as_str();
+        let path = re
+            .captures(buffer_path.to_str().unwrap())
+            .unwrap()
+            .get(1)
+            .unwrap()
+            .as_str();
         return Ok((Side::LEFT, Path::new(path).to_path_buf()));
     }
 
@@ -505,7 +520,11 @@ fn test_leave_two_comments() {
         .build();
     // api::command("25,28ReviewComment").unwrap();
     api::cmd(&info, &opts).unwrap();
-    api::feedkeys(string!("Test.").as_nvim_str(), string!("i").as_nvim_str(), false);
+    api::feedkeys(
+        string!("Test.").as_nvim_str(),
+        string!("i").as_nvim_str(),
+        false,
+    );
     api::command("w").unwrap();
     // api::command("50").unwrap();
     // api::command("ReviewComment").unwrap();
@@ -631,7 +650,14 @@ impl Review {
     pub fn save(&self) {
         let review_file_path = get_review_file_path(self.pr_number);
         let mut file = match File::create(&review_file_path) {
-            Err(err) => panic!("Error creating {}: {}", review_file_path.display(), err),
+            Err(err) => {
+                api::err_writeln(&format!(
+                    "Error creating {}: {}",
+                    review_file_path.display(),
+                    err
+                ));
+                return;
+            }
             Ok(file) => file,
         };
         file.write_all(&serde_json::to_string(&self).unwrap().as_bytes())
@@ -671,27 +697,35 @@ impl Review {
         self.comments.remove(idx);
     }
 
-    pub fn get_review(pr_number: u32) -> Self {
+    pub fn get_review(pr_number: u32) -> Option<Self> {
         let review_file_path = get_review_file_path(pr_number);
         if review_file_path.exists() {
             let mut review_string = String::new();
             match File::open(review_file_path) {
-                Err(e) => panic!("Could not open review file: {}", e),
+                Err(e) => {
+                    api::err_writeln(&format!("Could not open review file: {}", e));
+                    return None;
+                }
                 Ok(mut file) => {
                     file.read_to_string(&mut review_string).unwrap();
                 }
             }
-            serde_json::from_str(&review_string).unwrap()
+            Some(serde_json::from_str(&review_string).unwrap())
         } else {
             // New review
-            let config = get_config_from_file();
-            Review::new(
-                config.owner.to_string(),
-                config.repo.to_string(),
-                pr_number,
-                "".to_string(),
-                vec![],
-            )
+            match get_config_from_file() {
+                None => {
+                    api::err_writeln("Could not read configuration file.");
+                    return None;
+                }
+                Some(config) => Some(Review::new(
+                    config.owner.to_string(),
+                    config.repo.to_string(),
+                    pr_number,
+                    "".to_string(),
+                    vec![],
+                ))
+            }
         }
     }
 }
@@ -718,26 +752,36 @@ fn get_config_file_path() -> PathBuf {
     review_directory.join("config.json")
 }
 
-fn get_config_from_file() -> Config {
+fn get_config_from_file() -> Option<Config> {
     let config_file_path = get_config_file_path();
     let mut config_string = String::new();
     match File::open(&config_file_path) {
-        Err(e) => panic!(
-            "Could not open configuration file {}: {}",
-            config_file_path.display(),
-            e
-        ),
+        Err(e) => {
+            api::err_writeln(&format!(
+                "Could not open configuration file {}: {}",
+                config_file_path.display(),
+                e
+            ));
+            return None;
+        }
         Ok(mut file) => {
             file.read_to_string(&mut config_string).unwrap();
         }
     }
-    serde_json::from_str(&config_string).unwrap()
+    Some(serde_json::from_str(&config_string).unwrap())
 }
 
 pub fn update_configuration(config: Config) {
     let config_file_path = get_config_file_path();
     let mut file = match File::create(&config_file_path) {
-        Err(err) => panic!("Error creating {}: {}", config_file_path.display(), err),
+        Err(err) => {
+            api::err_writeln(&format!(
+                "Error creating {}: {}",
+                config_file_path.display(),
+                err
+            ));
+            return;
+        }
         Ok(file) => file,
     };
     file.write_all(&serde_json::to_string(&config).unwrap().as_bytes())
