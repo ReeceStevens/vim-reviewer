@@ -3,6 +3,7 @@ extern crate nvim_oxi;
 extern crate reqwest;
 extern crate serde;
 extern crate tempfile;
+extern crate regex;
 
 use git2::Repository;
 use nvim_oxi::api;
@@ -13,6 +14,7 @@ use nvim_oxi::{self as oxi, Array, Dictionary, Object};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
+use regex::Regex;
 
 use std::env;
 use std::fs::File;
@@ -460,6 +462,13 @@ fn get_current_buffer_path() -> ApiResult<(Side, PathBuf)> {
     let current_buffer = api::get_current_buf();
     let buffer_path = current_buffer.get_name().unwrap();
     let buffer_is_prior_rev = buffer_path.starts_with("fugitive://");
+    if buffer_is_prior_rev {
+        // Fugitive paths are of the form:
+        // fugitive://<hash>/path/to/file
+        let re = Regex::new(r".*/.git.*[a-f0-9]{40}/(.*)").unwrap();
+        let path = re.captures(buffer_path.to_str().unwrap()).unwrap().get(1).unwrap().as_str();
+        return Ok((Side::LEFT, Path::new(path).to_path_buf()));
+    }
 
     match buffer_path.strip_prefix(workdir) {
         Err(e) => {
@@ -471,7 +480,7 @@ fn get_current_buffer_path() -> ApiResult<(Side, PathBuf)> {
                 "Current buffer not a valid path in the repository".to_string(),
             ))
         }
-        Ok(path) => Ok((if buffer_is_prior_rev { Side::LEFT } else { Side::RIGHT }, path.to_path_buf())),
+        Ok(path) => Ok((Side::RIGHT, path.to_path_buf())),
     }
 }
 
