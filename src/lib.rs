@@ -9,7 +9,6 @@ use nvim_oxi::api;
 use nvim_oxi::string;
 use nvim_oxi::api::opts::{CmdOpts, CreateCommandOpts};
 use nvim_oxi::api::types::{CmdInfos, CommandArgs, CommandNArgs, CommandRange};
-use nvim_oxi::api::Buffer;
 use nvim_oxi::{self as oxi, Array, Dictionary, Object};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde::{Deserialize, Serialize};
@@ -103,13 +102,9 @@ fn vim_reviewer() -> oxi::Result<()> {
                 Some(review) => {
                     let mut sign_idx = 0;
                     api::command("sign unplace * group=PrReviewSigns")?;
-                    api::out_write(
-                        string!("Buffers: {:?}\n", api::list_bufs().map(|b| b.to_string()).collect::<std::string::String>())
-                    );
                     let buffers = api::list_bufs();
                     for buffer in buffers {
                         unsafe {
-                            api::out_write(string!("{}\n", buffer));
                             let buffer_path = get_current_buffer_path()?;
 
                             let obj: oxi::Object = (&buffer).into();
@@ -137,7 +132,6 @@ fn vim_reviewer() -> oxi::Result<()> {
                                     line,
                                     handle,
                                 );
-                                    api::out_write(string!("{}\n", &command));
                                     api::command(&command)?;
                                 }
                             }
@@ -165,7 +159,7 @@ fn vim_reviewer() -> oxi::Result<()> {
         "PublishReview",
         "Publish a review to GitHub",
         CommandNArgs::ZeroOrOne,
-        |args: CommandArgs| -> ApiResult<()> {
+        |_args: CommandArgs| -> ApiResult<()> {
             let review = get_current_review();
             match review {
                 Some(review) => {
@@ -254,8 +248,8 @@ fn vim_reviewer() -> oxi::Result<()> {
         "Save an in-progress review comment",
         CommandNArgs::ZeroOrOne,
         |args: CommandArgs| -> ApiResult<()> {
-            // let is_new_comment = args.args;
-            let is_new_comment = args.args.unwrap_or("".to_string()) == "new".to_string();
+            let command_args = args.args.unwrap_or("".to_string());
+            let is_new_comment = command_args == "new".to_string();
             let review = get_current_review();
             match review {
                 None => {
@@ -268,8 +262,11 @@ fn vim_reviewer() -> oxi::Result<()> {
                             review.in_progress_comment = None;
                             if is_new_comment {
                                 review.add_comment(comment.clone());
+                            } else {
+                                let (_, idx) = command_args.split_once(" ").unwrap();
+                                let idx: usize = str::parse(idx).unwrap();
+                                review.comments[idx] = comment.clone();
                             }
-                            // TODO: else update existing comment
                             review.save();
                         }
                         None => {
@@ -344,9 +341,9 @@ fn vim_reviewer() -> oxi::Result<()> {
                             // TODO: Cleanup of current review
                             Ok(())
                         }
-                        Some(comment) => {
+                        Some((idx, comment)) => {
                             // TODO: in progress comment management
-                            new_temporary_buffer(Some("SaveComment existing"))?;
+                            new_temporary_buffer(Some(&format!("SaveComment existing {}", idx)))?;
                             set_text_in_buffer(comment.body.clone())?;
                             review.in_progress_comment = Some(comment.clone());
                             review.save();
@@ -380,7 +377,7 @@ fn vim_reviewer() -> oxi::Result<()> {
                             api::err_writeln("No comment under the cursor.");
                             Ok(())
                         }
-                        Some(comment) => {
+                        Some((_idx, comment)) => {
                             // TODO: Messy handling of comment deletion
                             review.delete_comment(&comment.clone());
                             review.save();
@@ -635,11 +632,12 @@ impl Review {
 
     /// Return the first comment in this review whose span contains the requested file path and
     /// line.
-    pub fn get_comment_at_position(&self, path: String, line: u32) -> Option<&Comment> {
-        let eligible_comments: Vec<&Comment> = self
+    pub fn get_comment_at_position(&self, path: String, line: u32) -> Option<(usize, &Comment)> {
+        let eligible_comments: Vec<(usize, &Comment)> = self
             .comments
             .iter()
-            .filter(|comment| {
+            .enumerate()
+            .filter(|(_idx, comment)| {
                 return comment.path == path
                     && (comment.line == line
                         || (comment.start_line.is_some()

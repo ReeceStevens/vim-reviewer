@@ -1,5 +1,5 @@
 let &runtimepath.=','.escape(expand('<sfile>:p:h'), '\,')
-" set rtp+=/Users/reecestevens/projects/vim-reviewer
+set rtp+=/Users/reecestevens/projects/vim-reviewer
 
 lua << EOF
 
