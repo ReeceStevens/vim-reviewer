@@ -74,7 +74,66 @@ Similarly, you can use the `:ReviewBody` command to fill out the body of a PR
 review.
 
 Once you're done leaving comments, you can type `:PublishReview` to push the
-draft review up to github.
+draft review up to GitHub or GitLab.
+
+### GitHub vs GitLab Support
+
+The plugin automatically detects whether your repository is hosted on GitHub or
+GitLab based on the remote URL. Both SSH and HTTPS URLs are supported:
+
+- **GitHub**: `git@github.com:owner/repo.git` or `https://github.com/owner/repo.git`
+- **GitLab**: `git@gitlab.com:owner/repo.git` or `https://gitlab.com/owner/repo.git`
+
+### Authentication
+
+The plugin requires an API token to publish reviews. There are two ways to provide authentication:
+
+#### Option 1: Configuration File (Recommended)
+
+Create a `vim-reviewer.toml` file in your project's root directory with the following format:
+
+```toml
+[backend]
+type = "gitlab"  # or "github"
+url = "https://gitlab.example.com"  # optional - defaults to detecting from git remote
+token = "your-api-token-here"
+```
+
+The plugin will automatically detect this file and use the token specified. The `url` field is optional - if omitted, the plugin will detect the repository URL from your git remote.
+
+**Example for GitHub:**
+```toml
+[backend]
+type = "github"
+token = "ghp_xxxxxxxxxxxxxxxxxxxx"
+```
+
+**Example for GitLab with custom URL:**
+```toml
+[backend]
+type = "gitlab"
+url = "https://gitlab.example.com/owner/repo"
+token = "glpat-xxxxxxxxxxxxxxxxxxxx"
+```
+
+#### Option 2: Environment Variables
+
+Alternatively, you can set environment variables:
+
+- **GitHub**: Set the `GH_REVIEW_API_TOKEN` environment variable with your GitHub personal access token
+- **GitLab**: Set the `GITLAB_TOKEN` environment variable with your GitLab personal access token
+
+For GitHub, create a token at https://github.com/settings/tokens with the `repo` scope.
+
+For GitLab, create a token at https://gitlab.com/-/user_settings/personal_access_tokens with the `api` scope.
+
+**Note:** The configuration file takes precedence over environment variables and git remote detection.
+
+**Security Warning:** If you use the `vim-reviewer.toml` configuration file, make sure to add it to your `.gitignore` to avoid accidentally committing your API token to version control:
+
+```bash
+echo "vim-reviewer.toml" >> .gitignore
+```
 
 ## Internals
 
@@ -107,7 +166,7 @@ line number. Once I finish my review, I have to open up GitHub and copy over my
 comments to the right spot.
 
 The first pain point this plugin is meant to solve is this last copy step-- now,
-I can leave comments directly in vim, then publish them all to github as a draft
+I can leave comments directly in vim, then publish them all to GitHub or GitLab as a draft
 review.
 
 ## FAQ
