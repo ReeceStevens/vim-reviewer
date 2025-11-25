@@ -978,13 +978,25 @@ impl Review {
 
         // Now create discussion threads for each comment
         for comment in &self.comments {
+            // For multi-line comments, use start_line and line (end line)
+            // For single-line comments, start_line will be line-1, so use line for both
+            let is_multi_line = comment.start_line.is_some() 
+                && comment.start_line.unwrap() != comment.line 
+                && comment.start_line.unwrap() != comment.line - 1;
+            
+            let (line_start, line_end) = if is_multi_line {
+                (comment.start_line.unwrap(), comment.line)
+            } else {
+                (comment.line, comment.line)
+            };
+
             let new_line = if comment.side == Side::RIGHT {
-                serde_json::Value::from(comment.start_line)
+                serde_json::Value::from(line_start)
             } else {
                 serde_json::Value::Null
             };
             let old_line = if comment.side == Side::LEFT {
-                serde_json::Value::from(comment.start_line)
+                serde_json::Value::from(line_start)
             } else {
                 serde_json::Value::Null
             };
@@ -1002,18 +1014,49 @@ impl Review {
                 (serde_json::Value::Null, serde_json::Value::from(comment_path))
             };
 
+            // Build position object with optional line_range for multi-line comments
+            let mut position = serde_json::json!({
+                "position_type": "text",
+                "base_sha": base_sha,
+                "start_sha": start_sha,
+                "head_sha": head_sha,
+                "new_path": new_path,
+                "old_path": old_path,
+                "new_line": new_line,
+                "old_line": old_line,
+            });
+
+            // Add line_range for multi-line comments
+            if is_multi_line {
+                let line_range = if comment.side == Side::RIGHT {
+                    serde_json::json!({
+                        "start": {
+                            "line_code": format!("{}_{}", comment.path, line_start),
+                            "type": "new",
+                        },
+                        "end": {
+                            "line_code": format!("{}_{}", comment.path, line_end),
+                            "type": "new",
+                        }
+                    })
+                } else {
+                    serde_json::json!({
+                        "start": {
+                            "line_code": format!("{}_{}", comment.path, line_start),
+                            "type": "old",
+                        },
+                        "end": {
+                            "line_code": format!("{}_{}", comment.path, line_end),
+                            "type": "old",
+                        }
+                    })
+                };
+                position["line_range"] = line_range;
+            }
+
             let discussion_payload = serde_json::json!({
                 "body": comment.body,
-                "position": {
-                    "position_type": "text",
-                    "base_sha": base_sha,
-                    "start_sha": start_sha,
-                    "head_sha": head_sha,
-                    "new_path": new_path,
-                    "old_path": old_path,
-                    "new_line": new_line,
-                    "old_line": old_line,
-                }
+                "position": position
             });
 
             api::out_write(string!( "Posting payload {:?} to GitLab\n", discussion_payload));
@@ -1196,3 +1239,6 @@ pub fn update_configuration(config: Config) {
     file.write_all(&serde_json::to_string(&config).unwrap().as_bytes())
         .unwrap();
 }
+
+
+
