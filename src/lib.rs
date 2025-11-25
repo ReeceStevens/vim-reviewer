@@ -980,10 +980,10 @@ impl Review {
         for comment in &self.comments {
             // For multi-line comments, use start_line and line (end line)
             // For single-line comments, start_line will be line-1, so use line for both
-            let is_multi_line = comment.start_line.is_some() 
-                && comment.start_line.unwrap() != comment.line 
+            let is_multi_line = comment.start_line.is_some()
+                && comment.start_line.unwrap() != comment.line
                 && comment.start_line.unwrap() != comment.line - 1;
-            
+
             let (line_start, line_end) = if is_multi_line {
                 (comment.start_line.unwrap(), comment.line)
             } else {
@@ -1009,9 +1009,15 @@ impl Review {
             };
 
             let (new_path, old_path) = if comment.side == Side::RIGHT {
-                (serde_json::Value::from(comment_path), serde_json::Value::Null)
+                (
+                    serde_json::Value::from(comment_path.clone()),
+                    serde_json::Value::Null,
+                )
             } else {
-                (serde_json::Value::Null, serde_json::Value::from(comment_path))
+                (
+                    serde_json::Value::Null,
+                    serde_json::Value::from(comment_path.clone()),
+                )
             };
 
             // Build position object with optional line_range for multi-line comments
@@ -1028,25 +1034,64 @@ impl Review {
 
             // Add line_range for multi-line comments
             if is_multi_line {
+                // Get the git blob hash for the file at the appropriate commit
+                // Line code format: <blob_SHA>_<old>_<new>
+                let repo = match Repository::open_from_env() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        api::err_writeln(&format!("Failed to open git repository: {}", e));
+                        continue;
+                    }
+                };
+
+                // Get the blob hash for the file at the appropriate commit
+                let (old_blob_hash, new_blob_hash) =
+                    match get_file_blob_hashes(&repo, &comment_path, base_sha, head_sha) {
+                        Ok(hashes) => hashes,
+                        Err(e) => {
+                            api::err_writeln(&format!(
+                                "Failed to get blob hash for {}: {}",
+                                comment_path, e
+                            ));
+                            continue;
+                        }
+                    };
+
+                // For RIGHT side (new): Use new blob hash
+                // For LEFT side (old): Use old blob hash
+                let (start_line_code, end_line_code) = if comment.side == Side::RIGHT {
+                    // New file side - format: blob_sha_old_new
+                    (
+                        format!("{}__{}", new_blob_hash, line_start),
+                        format!("{}__{}", new_blob_hash, line_end),
+                    )
+                } else {
+                    // Old file side - format: blob_sha_old_new
+                    (
+                        format!("{}_{}_", old_blob_hash, line_start),
+                        format!("{}_{}_", old_blob_hash, line_end),
+                    )
+                };
+
                 let line_range = if comment.side == Side::RIGHT {
                     serde_json::json!({
                         "start": {
-                            "line_code": format!("{}_{}", comment.path, line_start),
+                            "line_code": start_line_code,
                             "type": "new",
                         },
                         "end": {
-                            "line_code": format!("{}_{}", comment.path, line_end),
+                            "line_code": end_line_code,
                             "type": "new",
                         }
                     })
                 } else {
                     serde_json::json!({
                         "start": {
-                            "line_code": format!("{}_{}", comment.path, line_start),
+                            "line_code": start_line_code,
                             "type": "old",
                         },
                         "end": {
-                            "line_code": format!("{}_{}", comment.path, line_end),
+                            "line_code": end_line_code,
                             "type": "old",
                         }
                     })
@@ -1059,7 +1104,10 @@ impl Review {
                 "position": position
             });
 
-            api::out_write(string!( "Posting payload {:?} to GitLab\n", discussion_payload));
+            api::out_write(string!(
+                "Posting payload {:?} to GitLab\n",
+                discussion_payload
+            ));
 
             let url = format!(
                 "{}/api/v4/projects/{}/merge_requests/{}/discussions",
@@ -1182,6 +1230,69 @@ impl Review {
     }
 }
 
+/// Get the git blob hash for a file at the old (base) and new (head) commits
+/// Returns (old_blob_hash, new_blob_hash)
+fn get_file_blob_hashes(
+    repo: &Repository,
+    file_path: &str,
+    base_sha: &str,
+    head_sha: &str,
+) -> Result<(String, String), String> {
+    // Get the old blob hash (from base commit)
+    let old_blob_hash = match get_blob_hash_at_commit(repo, file_path, base_sha) {
+        Ok(hash) => hash,
+        Err(_) => {
+            // File might not exist in base commit (new file), use empty hash
+            "0000000000000000000000000000000000000000".to_string()
+        }
+    };
+
+    // Get the new blob hash (from head commit)
+    let new_blob_hash = match get_blob_hash_at_commit(repo, file_path, head_sha) {
+        Ok(hash) => hash,
+        Err(_) => {
+            // File might not exist in head commit (deleted file), use empty hash
+            "0000000000000000000000000000000000000000".to_string()
+        }
+    };
+
+    Ok((old_blob_hash, new_blob_hash))
+}
+
+/// Get the git blob hash for a file at a specific commit
+fn get_blob_hash_at_commit(
+    repo: &Repository,
+    file_path: &str,
+    commit_sha: &str,
+) -> Result<String, String> {
+    // Parse the commit SHA
+    let oid = match git2::Oid::from_str(commit_sha) {
+        Ok(oid) => oid,
+        Err(e) => return Err(format!("Invalid commit SHA: {}", e)),
+    };
+
+    // Get the commit object
+    let commit = match repo.find_commit(oid) {
+        Ok(commit) => commit,
+        Err(e) => return Err(format!("Failed to find commit: {}", e)),
+    };
+
+    // Get the tree from the commit
+    let tree = match commit.tree() {
+        Ok(tree) => tree,
+        Err(e) => return Err(format!("Failed to get tree: {}", e)),
+    };
+
+    // Get the tree entry for the file
+    let entry = match tree.get_path(std::path::Path::new(file_path)) {
+        Ok(entry) => entry,
+        Err(e) => return Err(format!("Failed to find file in tree: {}", e)),
+    };
+
+    // Return the blob hash
+    Ok(entry.id().to_string())
+}
+
 fn get_review_directory() -> PathBuf {
     let output = Command::new("git")
         .arg("rev-parse")
@@ -1239,6 +1350,3 @@ pub fn update_configuration(config: Config) {
     file.write_all(&serde_json::to_string(&config).unwrap().as_bytes())
         .unwrap();
 }
-
-
-
