@@ -1053,21 +1053,63 @@ impl Review {
                 hasher.update(comment_path.as_bytes());
                 let file_hash = format!("{:x}", hasher.finalize());
 
-                // For RIGHT side (new): Use format file_hash__new_line
-                // For LEFT side (old): Use format file_hash_old_line_
-                let (start_line_code, end_line_code) = if comment.side == Side::RIGHT {
-                    // New file side - format: hash__new
-                    (
-                        format!("{}__{}", file_hash, line_start),
-                        format!("{}__{}", file_hash, line_end),
-                    )
-                } else {
-                    // Old file side - format: hash_old_
-                    (
-                        format!("{}_{}_", file_hash, line_start),
-                        format!("{}_{}_", file_hash, line_end),
-                    )
+                // Get the repository to look up line mappings
+                let repo = match Repository::open_from_env() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        api::err_writeln(&format!("Failed to open git repository: {}", e));
+                        continue;
+                    }
                 };
+
+                // Get old/new line mappings for start and end lines
+                let (start_old, start_new) = match get_line_mapping(
+                    &repo,
+                    &comment_path,
+                    base_sha,
+                    head_sha,
+                    line_start,
+                    comment.side,
+                ) {
+                    Ok(mapping) => mapping,
+                    Err(e) => {
+                        api::err_writeln(&format!(
+                            "Failed to get line mapping for {}: {}",
+                            comment_path, e
+                        ));
+                        continue;
+                    }
+                };
+
+                let (end_old, end_new) = match get_line_mapping(
+                    &repo,
+                    &comment_path,
+                    base_sha,
+                    head_sha,
+                    line_end,
+                    comment.side,
+                ) {
+                    Ok(mapping) => mapping,
+                    Err(e) => {
+                        api::err_writeln(&format!(
+                            "Failed to get line mapping for {}: {}",
+                            comment_path, e
+                        ));
+                        continue;
+                    }
+                };
+
+                // Build line codes with both old and new line numbers
+                let start_line_code = format!("{}_{}_{}",
+                    file_hash,
+                    start_old.map(|n| n.to_string()).unwrap_or_default(),
+                    start_new.map(|n| n.to_string()).unwrap_or_default()
+                );
+                let end_line_code = format!("{}_{}_{}",
+                    file_hash,
+                    end_old.map(|n| n.to_string()).unwrap_or_default(),
+                    end_new.map(|n| n.to_string()).unwrap_or_default()
+                );
 
                 let line_range = if comment.side == Side::RIGHT {
                     serde_json::json!({
@@ -1230,6 +1272,104 @@ impl Review {
     }
 }
 
+/// Get the old and new line numbers for a given line in a diff
+/// Returns (Option<old_line>, Option<new_line>)
+/// If the line is only in the old file (deleted), new_line will be None
+/// If the line is only in the new file (added), old_line will be None
+fn get_line_mapping(
+    repo: &Repository,
+    file_path: &str,
+    base_sha: &str,
+    head_sha: &str,
+    line_number: u32,
+    side: Side,
+) -> Result<(Option<u32>, Option<u32>), String> {
+    // Parse commit SHAs
+    let base_oid = git2::Oid::from_str(base_sha)
+        .map_err(|e| format!("Invalid base SHA: {}", e))?;
+    let head_oid = git2::Oid::from_str(head_sha)
+        .map_err(|e| format!("Invalid head SHA: {}", e))?;
+
+    // Get commit objects
+    let base_commit = repo
+        .find_commit(base_oid)
+        .map_err(|e| format!("Failed to find base commit: {}", e))?;
+    let head_commit = repo
+        .find_commit(head_oid)
+        .map_err(|e| format!("Failed to find head commit: {}", e))?;
+
+    // Get trees
+    let base_tree = base_commit
+        .tree()
+        .map_err(|e| format!("Failed to get base tree: {}", e))?;
+    let head_tree = head_commit
+        .tree()
+        .map_err(|e| format!("Failed to get head tree: {}", e))?;
+
+    // Create diff
+    let diff = repo
+        .diff_tree_to_tree(Some(&base_tree), Some(&head_tree), None)
+        .map_err(|e| format!("Failed to create diff: {}", e))?;
+
+    // Find the file in the diff and build line mapping
+    let mut line_map: Vec<(Option<u32>, Option<u32>)> = Vec::new();
+    
+    diff.foreach(
+        &mut |delta, _progress| {
+            let delta_path = delta.new_file().path().unwrap_or(delta.old_file().path().unwrap());
+            if delta_path.to_str() == Some(file_path) {
+                true
+            } else {
+                true
+            }
+        },
+        None,
+        None,
+        Some(&mut |_delta, _hunk, line| {
+            match line.origin() {
+                ' ' => {
+                    // Context line - exists in both old and new
+                    line_map.push((line.old_lineno(), line.new_lineno()));
+                }
+                '-' => {
+                    // Deleted line - only in old
+                    line_map.push((line.old_lineno(), None));
+                }
+                '+' => {
+                    // Added line - only in new
+                    line_map.push((None, line.new_lineno()));
+                }
+                _ => {}
+            }
+            true
+        }),
+    )
+    .map_err(|e| format!("Failed to process diff: {}", e))?;
+
+    // Find the mapping for the requested line
+    // The line_number is relative to the side (old or new)
+    for (old_line, new_line) in &line_map {
+        if side == Side::LEFT {
+            // Looking for old line number
+            if let Some(old) = old_line {
+                if *old == line_number {
+                    return Ok((*old_line, *new_line));
+                }
+            }
+        } else {
+            // Looking for new line number
+            if let Some(new) = new_line {
+                if *new == line_number {
+                    return Ok((*old_line, *new_line));
+                }
+            }
+        }
+    }
+
+    // If not found in diff, the line is unchanged - both old and new have same number
+    Ok((Some(line_number), Some(line_number)))
+}
+
 fn get_review_directory() -> PathBuf {
     let output = Command::new("git")
         .arg("rev-parse")
@@ -1287,6 +1427,8 @@ pub fn update_configuration(config: Config) {
     file.write_all(&serde_json::to_string(&config).unwrap().as_bytes())
         .unwrap();
 }
+
+
 
 
 
