@@ -1029,8 +1029,6 @@ impl Review {
                     "base_sha": base_sha,
                     "start_sha": start_sha,
                     "head_sha": head_sha,
-                    "new_path": new_path,
-                    "old_path": old_path,
                 })
             } else {
                 serde_json::json!({
