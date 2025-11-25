@@ -1100,13 +1100,13 @@ impl Review {
                 // Build line codes with both old and new line numbers
                 let start_line_code = format!("{}_{}_{}",
                     file_hash,
-                    start_old.map(|n| n.to_string()).unwrap_or_default(),
-                    start_new.map(|n| n.to_string()).unwrap_or_default()
+                    start_old.map(|n| n.to_string()).unwrap_or("0".to_string()),
+                    start_new.map(|n| n.to_string()).unwrap_or("0".to_string())
                 );
                 let end_line_code = format!("{}_{}_{}",
                     file_hash,
-                    end_old.map(|n| n.to_string()).unwrap_or_default(),
-                    end_new.map(|n| n.to_string()).unwrap_or_default()
+                    end_old.map(|n| n.to_string()).unwrap_or("0".to_string()),
+                    end_new.map(|n| n.to_string()).unwrap_or("0".to_string())
                 );
 
                 let line_range = if comment.side == Side::RIGHT {
