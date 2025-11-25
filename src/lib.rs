@@ -989,6 +989,19 @@ impl Review {
                 serde_json::Value::Null
             };
 
+            // If path is a windows path, convert to unix
+            let comment_path = if cfg!(windows) {
+                comment.path.replace("\\", "/")
+            } else {
+                comment.path.clone()
+            };
+
+            let (new_path, old_path) = if comment.side == Side::RIGHT {
+                (serde_json::Value::from(comment_path), serde_json::Value::Null)
+            } else {
+                (serde_json::Value::Null, serde_json::Value::from(comment_path))
+            };
+
             let discussion_payload = serde_json::json!({
                 "body": comment.body,
                 "position": {
@@ -996,12 +1009,14 @@ impl Review {
                     "base_sha": base_sha,
                     "start_sha": start_sha,
                     "head_sha": head_sha,
-                    "new_path": comment.path,
-                    "old_path": comment.path,
+                    "new_path": new_path,
+                    "old_path": old_path,
                     "new_line": new_line,
                     "old_line": old_line,
                 }
             });
+
+            api::out_write(string!( "Posting payload {:?} to GitLab\n", discussion_payload));
 
             let url = format!(
                 "{}/api/v4/projects/{}/merge_requests/{}/discussions",
