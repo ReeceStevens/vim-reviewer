@@ -4,6 +4,7 @@ extern crate regex;
 extern crate reqwest;
 extern crate serde;
 extern crate tempfile;
+extern crate toml;
 
 use git2::Repository;
 use nvim_oxi::api;
@@ -35,28 +36,237 @@ macro_rules! create_command {
 
 type ApiResult<T> = std::result::Result<T, api::Error>;
 
-/// Based on the remote URL, parse out the repository name and owner.
-///
-/// TODO: Currently, this assumes an SSH-formatted remote URL, such as
-/// git@github.com:reecestevens/vim-reviewer.
-///
-/// Future work: this function can be used to determine which git backend is used (GitHub, GitLab,
-/// etc)
-fn parse_config_from_url(url: &str) -> Result<(String, String), String> {
-    let repository_info = url.split(":").last();
-    let results = match repository_info {
-        Some(info) => info.split("/").collect::<Vec<&str>>(),
-        None => return Err("Invalid repository url".to_string()),
-    };
-    Ok((
-        results[0].to_string(),
-        results[1].to_string().replace(".git", ""),
-    ))
+/// Git backend type (GitHub or GitLab)
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub enum GitBackend {
+    GitHub,
+    GitLab,
 }
 
-/// Update the repository configuration based on the current origin remote
+/// Configuration structure for vim-reviewer.toml file
+#[derive(Deserialize, Debug)]
+struct TomlConfig {
+    backend: TomlBackendConfig,
+}
+
+#[derive(Deserialize, Debug)]
+struct TomlBackendConfig {
+    #[serde(rename = "type")]
+    backend_type: String,
+    url: Option<String>,
+    token: String,
+}
+
+/// Based on the remote URL, parse out the repository name, owner, and backend type.
+///
+/// Supports both SSH and HTTPS URLs for GitHub and GitLab.
+/// Examples:
+/// - git@github.com:owner/repo.git -> (owner, repo, GitHub)
+/// - https://github.com/owner/repo.git -> (owner, repo, GitHub)
+/// - git@gitlab.com:owner/repo.git -> (owner, repo, GitLab)
+/// - https://gitlab.com/owner/repo.git -> (owner, repo, GitLab)
+fn parse_config_from_url(url: &str) -> Result<(String, String, GitBackend), String> {
+    // Determine backend from URL
+    let backend = if url.contains("gitlab") {
+        GitBackend::GitLab
+    } else if url.contains("github") {
+        GitBackend::GitHub
+    } else {
+        return Err("Could not determine git backend (GitHub or GitLab) from URL".to_string());
+    };
+
+    // Parse SSH format (git@host:owner/repo.git)
+    if url.contains("@") && url.contains(":") && !url.contains("://") {
+        let repository_info = url.split(":").last();
+        let results = match repository_info {
+            Some(info) => info.split("/").collect::<Vec<&str>>(),
+            None => return Err("Invalid repository url".to_string()),
+        };
+        if results.len() < 2 {
+            return Err("Invalid repository url format".to_string());
+        }
+        return Ok((
+            results[0].to_string(),
+            results[1].to_string().replace(".git", ""),
+            backend,
+        ));
+    }
+
+    // Parse HTTPS format (https://host/owner/repo.git)
+    if url.contains("://") {
+        let parts: Vec<&str> = url.split("://").collect();
+        if parts.len() < 2 {
+            return Err("Invalid HTTPS repository url".to_string());
+        }
+        let path_parts: Vec<&str> = parts[1].split("/").collect();
+        if path_parts.len() < 3 {
+            return Err("Invalid HTTPS repository url format".to_string());
+        }
+        return Ok((
+            path_parts[1].to_string(),
+            path_parts[2].to_string().replace(".git", ""),
+            backend,
+        ));
+    }
+
+    Err("Unsupported repository URL format".to_string())
+}
+
+/// Load configuration from vim-reviewer.toml in the current working directory, if it exists.
+/// Returns Some((owner, repo, backend, backend_url, token)) if the file exists and is valid, None otherwise.
+fn load_toml_config() -> Option<(String, String, GitBackend, Option<String>, String)> {
+    let config_path = env::current_dir().ok()?.join("vim-reviewer.toml");
+
+    if !config_path.exists() {
+        return None;
+    }
+
+    let mut config_contents = String::new();
+    let mut file = match File::open(&config_path) {
+        Ok(f) => f,
+        Err(e) => {
+            api::err_writeln(&format!("Failed to open vim-reviewer.toml: {}", e));
+            return None;
+        }
+    };
+
+    if let Err(e) = file.read_to_string(&mut config_contents) {
+        api::err_writeln(&format!("Failed to read vim-reviewer.toml: {}", e));
+        return None;
+    }
+
+    let toml_config: TomlConfig = match toml::from_str(&config_contents) {
+        Ok(config) => config,
+        Err(e) => {
+            api::err_writeln(&format!("Failed to parse vim-reviewer.toml: {}", e));
+            return None;
+        }
+    };
+
+    // Determine backend type
+    let backend = match toml_config.backend.backend_type.to_lowercase().as_str() {
+        "github" => GitBackend::GitHub,
+        "gitlab" => GitBackend::GitLab,
+        _ => {
+            api::err_writeln(&format!(
+                "Invalid backend type '{}' in vim-reviewer.toml. Must be 'github' or 'gitlab'.",
+                toml_config.backend.backend_type
+            ));
+            return None;
+        }
+    };
+
+    // Extract owner, repo, and base URL from the config
+    let (owner, repo, backend_url) = if let Some(url) = toml_config.backend.url {
+        match parse_config_from_url(&url) {
+            Ok((o, r, _)) => {
+                // Extract base URL (scheme + host) from the full URL
+                let base_url = if url.contains("://") {
+                    let parts: Vec<&str> = url.split("://").collect();
+                    if parts.len() >= 2 {
+                        let host_parts: Vec<&str> = parts[1].split("/").collect();
+                        Some(format!("{}://{}", parts[0], host_parts[0]))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                (o, r, base_url)
+            }
+            Err(e) => {
+                api::err_writeln(&format!(
+                    "Failed to parse URL from vim-reviewer.toml: {}",
+                    e
+                ));
+                return None;
+            }
+        }
+    } else {
+        // If no URL provided, fall back to detecting from git remote
+        let current_dir = match env::current_dir() {
+            Ok(dir) => dir,
+            Err(e) => {
+                api::err_writeln(&format!("Failed to get current directory: {}", e));
+                return None;
+            }
+        };
+        let repo = match Repository::open(current_dir) {
+            Ok(r) => r,
+            Err(e) => {
+                api::err_writeln(&format!(
+                    "No URL in vim-reviewer.toml and current directory is not a git repository: {}",
+                    e
+                ));
+                return None;
+            }
+        };
+        let remote_url = match repo.find_remote("origin") {
+            Ok(remote) => match remote.url() {
+                Some(url) => url.to_string(),
+                None => {
+                    api::err_writeln("Remote 'origin' has no URL");
+                    return None;
+                }
+            },
+            Err(e) => {
+                api::err_writeln(&format!(
+                    "No URL in vim-reviewer.toml and failed to find remote 'origin': {}",
+                    e
+                ));
+                return None;
+            }
+        };
+        match parse_config_from_url(&remote_url) {
+            Ok((o, r, _)) => (o, r, None),
+            Err(e) => {
+                api::err_writeln(&format!(
+                    "Failed to parse repository information from remote URL: {}",
+                    e
+                ));
+                return None;
+            }
+        }
+    };
+
+    Some((owner, repo, backend, backend_url, toml_config.backend.token))
+}
+
+/// Update the repository configuration based on vim-reviewer.toml if present,
+/// otherwise fall back to detecting from the current origin remote
 fn update_config_from_remote() -> oxi::Result<()> {
-    let repo = match Repository::open(env::current_dir().unwrap()) {
+    // First, try to load config from vim-reviewer.toml
+    if let Some((owner, repo_name, backend, backend_url, token)) = load_toml_config() {
+        // Store the token from TOML config as an environment variable
+        // This allows the rest of the code to use it transparently
+        let token_var = match &backend {
+            GitBackend::GitHub => "GH_REVIEW_API_TOKEN",
+            GitBackend::GitLab => "GITLAB_TOKEN",
+        };
+        unsafe {
+            env::set_var(token_var, token);
+        }
+
+        update_configuration(Config {
+            owner,
+            repo: repo_name,
+            backend,
+            backend_url,
+            active_pr: None,
+        });
+
+        return Ok(());
+    }
+
+    // Fall back to detecting from git remote
+    let current_dir = match env::current_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            api::err_writeln(&format!("Failed to get current directory: {}", e));
+            return Ok(());
+        }
+    };
+    let repo = match Repository::open(&current_dir) {
         Ok(repo) => repo,
         Err(e) => {
             api::err_writeln(&format!("Current directory is not a git repository: {}", e));
@@ -64,23 +274,34 @@ fn update_config_from_remote() -> oxi::Result<()> {
         }
     };
     let remote_url = match repo.find_remote("origin") {
-        Ok(remote) => remote.url().unwrap().to_string(),
+        Ok(remote) => match remote.url() {
+            Some(url) => url.to_string(),
+            None => {
+                api::err_writeln("Remote 'origin' has no URL");
+                return Ok(());
+            }
+        },
         Err(e) => {
             api::err_writeln(&format!("Failed to find remote 'origin': {}", e));
             return Ok(());
         }
     };
-    let (owner, repo) = match parse_config_from_url(&remote_url) {
+    let (owner, repo_name, backend) = match parse_config_from_url(&remote_url) {
         Ok(results) => results,
-        Err(_) => {
-            api::err_writeln("Failed to parse repository information from remote URL");
+        Err(e) => {
+            api::err_writeln(&format!(
+                "Failed to parse repository information from remote URL: {}",
+                e
+            ));
             return Ok(());
         }
     };
 
     update_configuration(Config {
         owner,
-        repo,
+        repo: repo_name,
+        backend,
+        backend_url: None,
         active_pr: None,
     });
 
@@ -157,7 +378,7 @@ fn vim_reviewer() -> oxi::Result<()> {
                 None => {
                     api::err_writeln("Could not read configuration file.");
                     return Ok(());
-                },
+                }
                 Some(mut config) => {
                     config.active_pr = Some(str::parse::<u32>(&args.args.unwrap()).unwrap());
                     update_configuration(config);
@@ -169,30 +390,41 @@ fn vim_reviewer() -> oxi::Result<()> {
 
     create_command!(
         "PublishReview",
-        "Publish a review to GitHub",
+        "Publish a review to GitHub or GitLab",
         CommandNArgs::ZeroOrOne,
         |_args: CommandArgs| -> ApiResult<()> {
             let review = get_current_review();
             match review {
                 Some(review) => {
-                    let token = match env::var("GH_REVIEW_API_TOKEN") {
+                    // Determine which token to use based on the backend
+                    let (token_var, backend_name) = match review.backend {
+                        GitBackend::GitHub => ("GH_REVIEW_API_TOKEN", "GitHub"),
+                        GitBackend::GitLab => ("GITLAB_TOKEN", "GitLab"),
+                    };
+
+                    let token = match env::var(token_var) {
                         Ok(token) => token,
                         Err(e) => {
                             api::err_writeln(&format!(
-                                "GH_REVIEW_API_TOKEN environment variable not set: {}",
-                                e
+                                "{} environment variable not set: {}",
+                                token_var, e
                             ));
                             return Ok(());
                         }
                     };
+
                     match review.publish(token) {
                         Ok(response) => {
                             let status = response.status();
                             if status.is_success() {
-                                api::out_write("Review published successfully\n");
+                                api::out_write(string!(
+                                    "Review published successfully to {}\n",
+                                    backend_name
+                                ));
                             } else {
                                 api::err_writeln(&format!(
-                                    "Failed to publish review ({:?}): {:?}",
+                                    "Failed to publish review to {} ({:?}): {:?}",
+                                    backend_name,
                                     status,
                                     response.text()
                                 ));
@@ -200,8 +432,8 @@ fn vim_reviewer() -> oxi::Result<()> {
                         }
                         Err(error) => {
                             api::err_writeln(&format!(
-                                "Failed to publish review due to error: {}",
-                                error
+                                "Failed to publish review to {} due to error: {}",
+                                backend_name, error
                             ));
                         }
                     };
@@ -499,6 +731,16 @@ fn get_current_buffer_path() -> ApiResult<(Side, PathBuf)> {
     }
 }
 
+#[test]
+fn test_environment_detection() {
+    let repo = Repository::open_from_env().unwrap();
+    let workdir = repo.workdir().unwrap();
+    let origin = repo.find_remote("origin").unwrap();
+    let remote_url = origin.url().unwrap();
+    println!("Workdir: {}", workdir.display());
+    println!("{:?}", parse_config_from_url(&remote_url).unwrap());
+}
+
 #[oxi::test]
 fn test_current_buffer_path() {
     api::command("e src/lib.rs").unwrap();
@@ -542,6 +784,9 @@ fn set_text_in_buffer(text: String) -> ApiResult<()> {
 pub struct Config {
     owner: String,
     repo: String,
+    backend: GitBackend,
+    #[serde(default)]
+    backend_url: Option<String>, // Base URL for the backend (e.g., "https://gitlab.example.com")
     active_pr: Option<u32>,
 }
 
@@ -585,6 +830,9 @@ impl Comment {
 pub struct Review {
     owner: String,
     repo: String,
+    backend: GitBackend,
+    #[serde(default)]
+    backend_url: Option<String>, // Base URL for the backend (e.g., "https://gitlab.example.com")
     pr_number: u32,
     body: String,
     comments: Vec<Comment>,
@@ -595,6 +843,8 @@ impl Review {
     fn new(
         owner: String,
         repo: String,
+        backend: GitBackend,
+        backend_url: Option<String>,
         pr_number: u32,
         body: String,
         comments: Vec<Comment>,
@@ -602,6 +852,8 @@ impl Review {
         Review {
             owner,
             repo,
+            backend,
+            backend_url,
             pr_number,
             body,
             comments,
@@ -610,14 +862,33 @@ impl Review {
     }
 
     fn post_url(&self) -> String {
-        format!(
-            "https://api.github.com/repos/{}/{}/pulls/{}/reviews",
-            self.owner, self.repo, self.pr_number
-        )
-        .to_string()
+        match self.backend {
+            GitBackend::GitHub => {
+                format!(
+                    "https://api.github.com/repos/{}/{}/pulls/{}/reviews",
+                    self.owner, self.repo, self.pr_number
+                )
+            }
+            GitBackend::GitLab => {
+                // GitLab uses project ID or URL-encoded path (owner/repo)
+                let project_path = format!("{}/{}", self.owner, self.repo);
+                let encoded_path = project_path.replace("/", "%2F");
+                format!(
+                    "https://gitlab.com/api/v4/projects/{}/merge_requests/{}/discussions",
+                    encoded_path, self.pr_number
+                )
+            }
+        }
     }
 
     pub fn publish(&self, token: String) -> Result<reqwest::blocking::Response, reqwest::Error> {
+        match self.backend {
+            GitBackend::GitHub => self.publish_github(token),
+            GitBackend::GitLab => self.publish_gitlab(token),
+        }
+    }
+
+    fn publish_github(&self, token: String) -> Result<reqwest::blocking::Response, reqwest::Error> {
         let client = reqwest::blocking::Client::new();
         fn header_map(token: String) -> HeaderMap {
             let mut headers = HeaderMap::new();
@@ -637,6 +908,245 @@ impl Review {
             .json(&self)
             .headers(header_map(token))
             .send()
+    }
+
+    fn publish_gitlab(&self, token: String) -> Result<reqwest::blocking::Response, reqwest::Error> {
+        let client = reqwest::blocking::Client::new();
+
+        fn header_map(token: String) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {}", token)).unwrap(),
+            );
+            headers.insert(USER_AGENT, HeaderValue::from_static("vim-reviewer"));
+            headers
+        }
+
+        // Use the backend_url from config, or default to gitlab.com
+        let base_url = self
+            .backend_url
+            .as_ref()
+            .map(|s| s.as_str())
+            .unwrap_or("https://gitlab.com");
+
+        let encoded_project = format!("{}/{}", self.owner, self.repo).replace("/", "%2F");
+        let mut last_response: Option<reqwest::blocking::Response> = None;
+
+        // GitLab API doesn't have a direct equivalent to GitHub's review API.
+        // We need to create individual discussion threads for each comment.
+        // First, create a general note with the review body if it exists
+        if !self.body.is_empty() {
+            let body_payload = serde_json::json!({
+                "body": self.body,
+            });
+            let mr_notes_url = format!(
+                "{}/api/v4/projects/{}/merge_requests/{}/notes",
+                base_url, encoded_project, self.pr_number
+            );
+            last_response = Some(
+                client
+                    .post(&mr_notes_url)
+                    .json(&body_payload)
+                    .headers(header_map(token.clone()))
+                    .send()?,
+            );
+        }
+
+        // Fetch MR details to get the required SHAs for diff comments
+        let mr_url = format!(
+            "{}/api/v4/projects/{}/merge_requests/{}",
+            base_url, encoded_project, self.pr_number
+        );
+        let mr_response = client
+            .get(&mr_url)
+            .headers(header_map(token.clone()))
+            .send()?;
+
+        // Parse the MR response to get the SHAs
+        let mr_data: serde_json::Value = match mr_response.json() {
+            Ok(data) => data,
+            Err(e) => {
+                api::err_writeln(&format!("Failed to parse MR data: {}", e));
+                return Err(e);
+            }
+        };
+
+        let base_sha = mr_data["diff_refs"]["base_sha"].as_str().unwrap_or("");
+        let start_sha = mr_data["diff_refs"]["start_sha"].as_str().unwrap_or("");
+        let head_sha = mr_data["diff_refs"]["head_sha"].as_str().unwrap_or("");
+
+        // Now create discussion threads for each comment
+        for comment in &self.comments {
+            // For multi-line comments, use start_line and line (end line)
+            // For single-line comments, start_line will be line-1, so use line for both
+            let is_multi_line = comment.start_line.is_some()
+                && comment.start_line.unwrap() != comment.line
+                && comment.start_line.unwrap() != comment.line - 1;
+
+            let (line_start, line_end) = if is_multi_line {
+                (comment.start_line.unwrap(), comment.line)
+            } else {
+                (comment.line, comment.line)
+            };
+
+            let new_line = if comment.side == Side::RIGHT {
+                serde_json::Value::from(line_start)
+            } else {
+                serde_json::Value::Null
+            };
+            let old_line = if comment.side == Side::LEFT {
+                serde_json::Value::from(line_start)
+            } else {
+                serde_json::Value::Null
+            };
+
+            // If path is a windows path, convert to unix
+            let comment_path = if cfg!(windows) {
+                comment.path.replace("\\", "/")
+            } else {
+                comment.path.clone()
+            };
+
+            let (new_path, old_path) = if comment.side == Side::RIGHT {
+                (
+                    serde_json::Value::from(comment_path.clone()),
+                    serde_json::Value::Null,
+                )
+            } else {
+                (
+                    serde_json::Value::Null,
+                    serde_json::Value::from(comment_path.clone()),
+                )
+            };
+
+            // Build position object
+            // For multi-line comments, use line_range instead of new_line/old_line
+            let mut position = if is_multi_line {
+                serde_json::json!({
+                    "position_type": "text",
+                    "base_sha": base_sha,
+                    "start_sha": start_sha,
+                    "head_sha": head_sha,
+                    "new_path": new_path,
+                    "old_path": old_path,
+                })
+            } else {
+                serde_json::json!({
+                    "position_type": "text",
+                    "base_sha": base_sha,
+                    "start_sha": start_sha,
+                    "head_sha": head_sha,
+                    "new_path": new_path,
+                    "old_path": old_path,
+                    "new_line": new_line,
+                    "old_line": old_line,
+                })
+            };
+
+            // Add line_range for multi-line comments
+            if is_multi_line {
+                // Get the git blob hash for the file at the appropriate commit
+                // Line code format: <blob_SHA>_<old>_<new>
+                let repo = match Repository::open_from_env() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        api::err_writeln(&format!("Failed to open git repository: {}", e));
+                        continue;
+                    }
+                };
+
+                // Get the blob hash for the file at the appropriate commit
+                let (old_blob_hash, new_blob_hash) =
+                    match get_file_blob_hashes(&repo, &comment_path, base_sha, head_sha) {
+                        Ok(hashes) => hashes,
+                        Err(e) => {
+                            api::err_writeln(&format!(
+                                "Failed to get blob hash for {}: {}",
+                                comment_path, e
+                            ));
+                            continue;
+                        }
+                    };
+
+                // For RIGHT side (new): Use new blob hash
+                // For LEFT side (old): Use old blob hash
+                let (start_line_code, end_line_code) = if comment.side == Side::RIGHT {
+                    // New file side - format: blob_sha_old_new
+                    (
+                        format!("{}__{}", new_blob_hash, line_start),
+                        format!("{}__{}", new_blob_hash, line_end),
+                    )
+                } else {
+                    // Old file side - format: blob_sha_old_new
+                    (
+                        format!("{}_{}_", old_blob_hash, line_start),
+                        format!("{}_{}_", old_blob_hash, line_end),
+                    )
+                };
+
+                let line_range = if comment.side == Side::RIGHT {
+                    serde_json::json!({
+                        "start": {
+                            "line_code": start_line_code,
+                            "type": "new",
+                        },
+                        "end": {
+                            "line_code": end_line_code,
+                            "type": "new",
+                        }
+                    })
+                } else {
+                    serde_json::json!({
+                        "start": {
+                            "line_code": start_line_code,
+                            "type": "old",
+                        },
+                        "end": {
+                            "line_code": end_line_code,
+                            "type": "old",
+                        }
+                    })
+                };
+                position["line_range"] = line_range;
+            }
+
+            let discussion_payload = serde_json::json!({
+                "body": comment.body,
+                "position": position
+            });
+
+            api::out_write(string!(
+                "Posting payload {:?} to GitLab\n",
+                discussion_payload
+            ));
+
+            let url = format!(
+                "{}/api/v4/projects/{}/merge_requests/{}/discussions",
+                base_url, encoded_project, self.pr_number
+            );
+
+            last_response = Some(
+                client
+                    .post(&url)
+                    .json(&discussion_payload)
+                    .headers(header_map(token.clone()))
+                    .send()?,
+            );
+        }
+
+        // Return the last response, or fetch the MR if no comments were posted
+        match last_response {
+            Some(response) => Ok(response),
+            None => {
+                // No comments or body, just verify the MR exists
+                let mr_url = format!(
+                    "{}/api/v4/projects/{}/merge_requests/{}",
+                    base_url, encoded_project, self.pr_number
+                );
+                client.get(&mr_url).headers(header_map(token)).send()
+            }
+        }
     }
 
     pub fn add_comment(&mut self, comment: Comment) {
@@ -721,13 +1231,78 @@ impl Review {
                 Some(config) => Some(Review::new(
                     config.owner.to_string(),
                     config.repo.to_string(),
+                    config.backend.clone(),
+                    config.backend_url.clone(),
                     pr_number,
                     "".to_string(),
                     vec![],
-                ))
+                )),
             }
         }
     }
+}
+
+/// Get the git blob hash for a file at the old (base) and new (head) commits
+/// Returns (old_blob_hash, new_blob_hash)
+fn get_file_blob_hashes(
+    repo: &Repository,
+    file_path: &str,
+    base_sha: &str,
+    head_sha: &str,
+) -> Result<(String, String), String> {
+    // Get the old blob hash (from base commit)
+    let old_blob_hash = match get_blob_hash_at_commit(repo, file_path, base_sha) {
+        Ok(hash) => hash,
+        Err(_) => {
+            // File might not exist in base commit (new file), use empty hash
+            "0000000000000000000000000000000000000000".to_string()
+        }
+    };
+
+    // Get the new blob hash (from head commit)
+    let new_blob_hash = match get_blob_hash_at_commit(repo, file_path, head_sha) {
+        Ok(hash) => hash,
+        Err(_) => {
+            // File might not exist in head commit (deleted file), use empty hash
+            "0000000000000000000000000000000000000000".to_string()
+        }
+    };
+
+    Ok((old_blob_hash, new_blob_hash))
+}
+
+/// Get the git blob hash for a file at a specific commit
+fn get_blob_hash_at_commit(
+    repo: &Repository,
+    file_path: &str,
+    commit_sha: &str,
+) -> Result<String, String> {
+    // Parse the commit SHA
+    let oid = match git2::Oid::from_str(commit_sha) {
+        Ok(oid) => oid,
+        Err(e) => return Err(format!("Invalid commit SHA: {}", e)),
+    };
+
+    // Get the commit object
+    let commit = match repo.find_commit(oid) {
+        Ok(commit) => commit,
+        Err(e) => return Err(format!("Failed to find commit: {}", e)),
+    };
+
+    // Get the tree from the commit
+    let tree = match commit.tree() {
+        Ok(tree) => tree,
+        Err(e) => return Err(format!("Failed to get tree: {}", e)),
+    };
+
+    // Get the tree entry for the file
+    let entry = match tree.get_path(std::path::Path::new(file_path)) {
+        Ok(entry) => entry,
+        Err(e) => return Err(format!("Failed to find file in tree: {}", e)),
+    };
+
+    // Return the blob hash
+    Ok(entry.id().to_string())
 }
 
 fn get_review_directory() -> PathBuf {
@@ -787,3 +1362,4 @@ pub fn update_configuration(config: Config) {
     file.write_all(&serde_json::to_string(&config).unwrap().as_bytes())
         .unwrap();
 }
+

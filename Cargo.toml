@@ -7,10 +7,11 @@ edition = "2024"
 
 [dependencies]
 serde_json = "1.0.85"
-serde = "1.0.145"
+serde = { version = "1.0.145", features = ["derive"] }
 git2 = "0.15.0"
 tempfile = "3.3.0"
 regex = "1.11.2"
+toml = "0.8"
 
 [dependencies.nvim-oxi]
 version = "0.6.0"
