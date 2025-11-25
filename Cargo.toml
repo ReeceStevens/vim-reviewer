@@ -12,6 +12,7 @@ git2 = "0.15.0"
 tempfile = "3.3.0"
 regex = "1.11.2"
 toml = "0.8"
+sha1 = "0.10"
 
 [dependencies.nvim-oxi]
 version = "0.6.0"
