@@ -1020,17 +1020,29 @@ impl Review {
                 )
             };
 
-            // Build position object with optional line_range for multi-line comments
-            let mut position = serde_json::json!({
-                "position_type": "text",
-                "base_sha": base_sha,
-                "start_sha": start_sha,
-                "head_sha": head_sha,
-                "new_path": new_path,
-                "old_path": old_path,
-                "new_line": new_line,
-                "old_line": old_line,
-            });
+            // Build position object
+            // For multi-line comments, use line_range instead of new_line/old_line
+            let mut position = if is_multi_line {
+                serde_json::json!({
+                    "position_type": "text",
+                    "base_sha": base_sha,
+                    "start_sha": start_sha,
+                    "head_sha": head_sha,
+                    "new_path": new_path,
+                    "old_path": old_path,
+                })
+            } else {
+                serde_json::json!({
+                    "position_type": "text",
+                    "base_sha": base_sha,
+                    "start_sha": start_sha,
+                    "head_sha": head_sha,
+                    "new_path": new_path,
+                    "old_path": old_path,
+                    "new_line": new_line,
+                    "old_line": old_line,
+                })
+            };
 
             // Add line_range for multi-line comments
             if is_multi_line {
@@ -1350,3 +1362,4 @@ pub fn update_configuration(config: Config) {
     file.write_all(&serde_json::to_string(&config).unwrap().as_bytes())
         .unwrap();
 }
+
