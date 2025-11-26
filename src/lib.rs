@@ -982,8 +982,8 @@ impl Review {
         for comment in &self.comments {
             // For multi-line comments, use start_line and line (end line)
             // For single-line comments, start_line will be line-1, so use line for both
-            let is_multi_line = comment.start_line.is_some()
-                && comment.start_line.unwrap() != comment.line;
+            let is_multi_line =
+                comment.start_line.is_some() && comment.start_line.unwrap() != comment.line;
 
             let (line_start, line_end) = if is_multi_line {
                 (comment.start_line.unwrap(), comment.line)
@@ -992,12 +992,12 @@ impl Review {
             };
 
             let new_line = if comment.side == Side::RIGHT {
-                serde_json::Value::from(line_start)
+                serde_json::Value::from(line_end)
             } else {
                 serde_json::Value::Null
             };
             let old_line = if comment.side == Side::LEFT {
-                serde_json::Value::from(line_start)
+                serde_json::Value::from(line_end)
             } else {
                 serde_json::Value::Null
             };
@@ -1029,6 +1029,10 @@ impl Review {
                     "base_sha": base_sha,
                     "start_sha": start_sha,
                     "head_sha": head_sha,
+                    "new_path": new_path,
+                    "old_path": old_path,
+                    "new_line": new_line,
+                    "old_line": old_line,
                 })
             } else {
                 serde_json::json!({
@@ -1098,12 +1102,14 @@ impl Review {
                 };
 
                 // Build line codes with both old and new line numbers
-                let start_line_code = format!("{}_{}_{}",
+                let start_line_code = format!(
+                    "{}_{}_{}",
                     file_hash,
                     start_old.map(|n| n.to_string()).unwrap_or("0".to_string()),
                     start_new.map(|n| n.to_string()).unwrap_or("0".to_string())
                 );
-                let end_line_code = format!("{}_{}_{}",
+                let end_line_code = format!(
+                    "{}_{}_{}",
                     file_hash,
                     end_old.map(|n| n.to_string()).unwrap_or("0".to_string()),
                     end_new.map(|n| n.to_string()).unwrap_or("0".to_string())
@@ -1114,12 +1120,14 @@ impl Review {
                         "start": {
                             "line_code": start_line_code,
                             "type": "new",
-                            "new_line": line_start,
+                            "new_line": start_new,
+                            "old_line": start_old,
                         },
                         "end": {
                             "line_code": end_line_code,
                             "type": "new",
-                            "new_line": line_end,
+                            "new_line": end_new,
+                            "old_line": end_old,
                         }
                     })
                 } else {
@@ -1127,12 +1135,14 @@ impl Review {
                         "start": {
                             "line_code": start_line_code,
                             "type": "old",
-                            "old_line": line_start,
+                            "new_line": start_new,
+                            "old_line": start_old,
                         },
                         "end": {
                             "line_code": end_line_code,
                             "type": "old",
-                            "old_line": line_end,
+                            "new_line": end_new,
+                            "old_line": end_old,
                         }
                     })
                 };
@@ -1283,10 +1293,8 @@ fn get_line_mapping(
     side: Side,
 ) -> Result<(Option<u32>, Option<u32>), String> {
     // Parse commit SHAs
-    let base_oid = git2::Oid::from_str(base_sha)
-        .map_err(|e| format!("Invalid base SHA: {}", e))?;
-    let head_oid = git2::Oid::from_str(head_sha)
-        .map_err(|e| format!("Invalid head SHA: {}", e))?;
+    let base_oid = git2::Oid::from_str(base_sha).map_err(|e| format!("Invalid base SHA: {}", e))?;
+    let head_oid = git2::Oid::from_str(head_sha).map_err(|e| format!("Invalid head SHA: {}", e))?;
 
     // Get commit objects
     let base_commit = repo
@@ -1311,10 +1319,13 @@ fn get_line_mapping(
 
     // Find the file in the diff and build line mapping
     let mut line_map: Vec<(Option<u32>, Option<u32>)> = Vec::new();
-    
+
     diff.foreach(
         &mut |delta, _progress| {
-            let delta_path = delta.new_file().path().unwrap_or(delta.old_file().path().unwrap());
+            let delta_path = delta
+                .new_file()
+                .path()
+                .unwrap_or(delta.old_file().path().unwrap());
             if delta_path.to_str() == Some(file_path) {
                 true
             } else {
@@ -1425,10 +1436,3 @@ pub fn update_configuration(config: Config) {
     file.write_all(&serde_json::to_string(&config).unwrap().as_bytes())
         .unwrap();
 }
-
-
-
-
-
-
-
