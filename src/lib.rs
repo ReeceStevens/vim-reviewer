@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use tempfile::NamedTempFile;
 
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::env;
 use std::fs::File;
 use std::io::prelude::*;
@@ -37,6 +39,21 @@ macro_rules! create_command {
 }
 
 type ApiResult<T> = std::result::Result<T, api::Error>;
+
+/// Action associated with a line in the status buffer.
+#[derive(Clone, Debug)]
+enum StatusLineAction {
+    None,
+    OpenFile(String),
+    JumpToComment(String, u32),
+    ToggleComment(usize),
+}
+
+thread_local! {
+    static EXPANDED_COMMENTS: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+    static STATUS_BUFFER_HANDLE: RefCell<Option<nvim_oxi::api::Buffer>> = RefCell::new(None);
+    static STATUS_LINE_ACTIONS: RefCell<Vec<StatusLineAction>> = RefCell::new(Vec::new());
+}
 
 /// Git backend type (GitHub or GitLab)
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -255,6 +272,7 @@ fn update_config_from_remote() -> oxi::Result<()> {
             backend,
             backend_url,
             active_pr: None,
+            base_branch: None,
         });
 
         return Ok(());
@@ -305,6 +323,7 @@ fn update_config_from_remote() -> oxi::Result<()> {
         backend,
         backend_url: None,
         active_pr: None,
+        base_branch: None,
     });
 
     Ok(())
@@ -373,8 +392,8 @@ fn vim_reviewer() -> oxi::Result<()> {
 
     create_command!(
         "StartReview",
-        "Start a review",
-        CommandNArgs::ZeroOrOne,
+        "Start a review: StartReview <pr_number> [base_branch]",
+        CommandNArgs::OneOrMore,
         |args: CommandArgs| -> ApiResult<()> {
             match get_config_from_file() {
                 None => {
@@ -382,8 +401,44 @@ fn vim_reviewer() -> oxi::Result<()> {
                     return Ok(());
                 }
                 Some(mut config) => {
-                    config.active_pr = Some(str::parse::<u32>(&args.args.unwrap()).unwrap());
+                    let raw = args.args.unwrap_or_default();
+                    let parts: Vec<&str> = raw.split_whitespace().collect();
+                    if parts.is_empty() {
+                        api::err_writeln("Usage: StartReview <pr_number> [base_branch]");
+                        return Ok(());
+                    }
+                    let pr_number = match str::parse::<u32>(parts[0]) {
+                        Ok(n) => n,
+                        Err(_) => {
+                            api::err_writeln("Invalid PR number.");
+                            return Ok(());
+                        }
+                    };
+                    config.active_pr = Some(pr_number);
+
+                    let base_branch = if parts.len() > 1 {
+                        parts[1].to_string()
+                    } else {
+                        // Try to detect default branch
+                        detect_default_branch().unwrap_or_else(|| "main".to_string())
+                    };
+                    config.base_branch = Some(base_branch);
                     update_configuration(config);
+
+                    // Optionally try API fetch for enrichment
+                    if let Some(config) = get_config_from_file() {
+                        if let Some(pr_info) = fetch_pr_info_from_api(&config, pr_number) {
+                            // Cache the enriched info
+                            if let Ok(json) = serde_json::to_string(&pr_info) {
+                                if let Ok(mut file) =
+                                    File::create(get_pr_info_cache_path(pr_number))
+                                {
+                                    let _ = file.write_all(json.as_bytes());
+                                }
+                            }
+                        }
+                    }
+
                     Ok(())
                 }
             }
@@ -664,6 +719,140 @@ fn vim_reviewer() -> oxi::Result<()> {
             }
         }
     );
+
+    // Status window commands
+    create_command!(
+        "ReviewStatus",
+        "Open or focus the review status window",
+        CommandNArgs::ZeroOrOne,
+        |_args: CommandArgs| -> ApiResult<()> {
+            let config = match get_config_from_file() {
+                Some(c) => c,
+                None => {
+                    api::err_writeln("No configuration file found. Run StartReview first.");
+                    return Ok(());
+                }
+            };
+            let pr_number = match config.active_pr {
+                Some(n) => n,
+                None => {
+                    api::err_writeln("No active review. Run StartReview first.");
+                    return Ok(());
+                }
+            };
+            open_status_buffer(pr_number)?;
+            Ok(())
+        }
+    );
+
+    create_command!(
+        "ReviewStatusRefresh",
+        "Force refresh the review status window",
+        CommandNArgs::ZeroOrOne,
+        |_args: CommandArgs| -> ApiResult<()> {
+            // Invalidate PrInfo cache so files are re-computed from git
+            if let Some(config) = get_config_from_file() {
+                if let Some(pr_number) = config.active_pr {
+                    let cache_path = get_pr_info_cache_path(pr_number);
+                    let _ = std::fs::remove_file(&cache_path);
+                }
+            }
+            refresh_status_buffer()?;
+            Ok(())
+        }
+    );
+
+    create_command!(
+        "ReviewStatusEnter",
+        "Activate the item under the cursor in the status window",
+        CommandNArgs::ZeroOrOne,
+        |_args: CommandArgs| -> ApiResult<()> {
+            let cursor = api::get_current_win().get_cursor()?;
+            let line_idx = (cursor.0 as usize).saturating_sub(1); // 1-indexed to 0-indexed
+
+            let action = STATUS_LINE_ACTIONS.with(|a| {
+                let actions = a.borrow();
+                actions.get(line_idx).cloned()
+            });
+
+            let config = get_config_from_file();
+            let base_branch = config
+                .as_ref()
+                .and_then(|c| c.base_branch.as_deref())
+                .unwrap_or("main");
+
+            match action {
+                Some(StatusLineAction::OpenFile(path)) => {
+                    // Move to window below, open file, run diff
+                    api::command("wincmd j")?;
+                    api::command(&format!("edit {}", path))?;
+                    let diff_cmd =
+                        format!("Gvdiffsplit origin/{}", base_branch);
+                    if let Err(_) = api::command(&diff_cmd) {
+                        // Fallback: just open the file without diff
+                        api::err_writeln("Could not open fugitive diff. Is vim-fugitive installed?");
+                    }
+                }
+                Some(StatusLineAction::JumpToComment(path, line)) => {
+                    api::command("wincmd j")?;
+                    api::command(&format!("edit {}", path))?;
+                    let diff_cmd =
+                        format!("Gvdiffsplit origin/{}", base_branch);
+                    let _ = api::command(&diff_cmd);
+                    api::command(&format!("{}", line))?;
+                }
+                Some(StatusLineAction::ToggleComment(idx)) => {
+                    EXPANDED_COMMENTS.with(|e| {
+                        let mut set = e.borrow_mut();
+                        if set.contains(&idx) {
+                            set.remove(&idx);
+                        } else {
+                            set.insert(idx);
+                        }
+                    });
+                    let saved_cursor = api::get_current_win().get_cursor()?;
+                    refresh_status_buffer()?;
+                    let _ = api::get_current_win().set_cursor(saved_cursor.0, saved_cursor.1);
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+    );
+
+    create_command!(
+        "ReviewStatusTab",
+        "Toggle expand/collapse of comment under cursor in status window",
+        CommandNArgs::ZeroOrOne,
+        |_args: CommandArgs| -> ApiResult<()> {
+            let cursor = api::get_current_win().get_cursor()?;
+            let line_idx = (cursor.0 as usize).saturating_sub(1);
+
+            let action = STATUS_LINE_ACTIONS.with(|a| {
+                let actions = a.borrow();
+                actions.get(line_idx).cloned()
+            });
+
+            match action {
+                Some(StatusLineAction::ToggleComment(idx)) => {
+                    EXPANDED_COMMENTS.with(|e| {
+                        let mut set = e.borrow_mut();
+                        if set.contains(&idx) {
+                            set.remove(&idx);
+                        } else {
+                            set.insert(idx);
+                        }
+                    });
+                    let saved_cursor = api::get_current_win().get_cursor()?;
+                    refresh_status_buffer()?;
+                    let _ = api::get_current_win().set_cursor(saved_cursor.0, saved_cursor.1);
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+    );
+
     Ok(())
 }
 
@@ -733,6 +922,628 @@ fn get_current_buffer_path() -> ApiResult<(Side, PathBuf)> {
     }
 }
 
+/// Detect the default branch by checking if main or master exists.
+fn detect_default_branch() -> Option<String> {
+    let repo = Repository::open_from_env().ok()?;
+    for branch_name in &["main", "master"] {
+        if repo
+            .revparse_single(&format!("origin/{}", branch_name))
+            .is_ok()
+            || repo.revparse_single(branch_name).is_ok()
+        {
+            return Some(branch_name.to_string());
+        }
+    }
+    None
+}
+
+/// Get files changed between base_branch and HEAD using local git operations.
+fn get_files_changed(base_branch: &str) -> Result<Vec<FileChange>, String> {
+    let repo = Repository::open_from_env().map_err(|e| format!("Failed to open repo: {}", e))?;
+
+    // Try origin/{base} first, then {base} directly
+    let base_ref = repo
+        .revparse_single(&format!("origin/{}", base_branch))
+        .or_else(|_| repo.revparse_single(base_branch))
+        .map_err(|e| format!("Failed to resolve base branch '{}': {}", base_branch, e))?;
+
+    let head_ref = repo
+        .revparse_single("HEAD")
+        .map_err(|e| format!("Failed to resolve HEAD: {}", e))?;
+
+    // Compute merge-base
+    let merge_base = repo
+        .merge_base(base_ref.id(), head_ref.id())
+        .map_err(|e| format!("Failed to find merge-base: {}", e))?;
+
+    let merge_base_commit = repo
+        .find_commit(merge_base)
+        .map_err(|e| format!("Failed to find merge-base commit: {}", e))?;
+    let merge_base_tree = merge_base_commit
+        .tree()
+        .map_err(|e| format!("Failed to get merge-base tree: {}", e))?;
+
+    let head_commit = head_ref
+        .peel_to_commit()
+        .map_err(|e| format!("Failed to peel HEAD to commit: {}", e))?;
+    let head_tree = head_commit
+        .tree()
+        .map_err(|e| format!("Failed to get HEAD tree: {}", e))?;
+
+    let diff = repo
+        .diff_tree_to_tree(Some(&merge_base_tree), Some(&head_tree), None)
+        .map_err(|e| format!("Failed to create diff: {}", e))?;
+
+    let mut files: Vec<FileChange> = Vec::new();
+
+    for idx in 0..diff.deltas().len() {
+        let delta = diff.get_delta(idx).unwrap();
+        let path = delta
+            .new_file()
+            .path()
+            .or_else(|| delta.old_file().path())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        let status = match delta.status() {
+            git2::Delta::Added => "A",
+            git2::Delta::Deleted => "D",
+            git2::Delta::Modified => "M",
+            git2::Delta::Renamed => "R",
+            git2::Delta::Copied => "C",
+            _ => "?",
+        }
+        .to_string();
+
+        // Count additions and deletions from the patch
+        let mut additions: u32 = 0;
+        let mut deletions: u32 = 0;
+
+        if let Ok(patch) = git2::Patch::from_diff(&diff, idx) {
+            if let Some(ref patch) = patch {
+                let (_, adds, dels) = patch.line_stats().unwrap_or((0, 0, 0));
+                additions = adds as u32;
+                deletions = dels as u32;
+            }
+        }
+
+        files.push(FileChange {
+            path,
+            additions,
+            deletions,
+            status,
+        });
+    }
+
+    Ok(files)
+}
+
+fn get_pr_info_cache_path(pr_number: u32) -> PathBuf {
+    get_review_directory().join(format!("{}-prinfo.json", pr_number))
+}
+
+/// Get or build PrInfo, using disk cache when available.
+fn get_or_build_pr_info(config: &Config, pr_number: u32) -> Option<PrInfo> {
+    let cache_path = get_pr_info_cache_path(pr_number);
+    let base_branch = config
+        .base_branch
+        .as_deref()
+        .unwrap_or("main")
+        .to_string();
+
+    // Try loading from cache
+    if cache_path.exists() {
+        if let Ok(mut file) = File::open(&cache_path) {
+            let mut contents = String::new();
+            if file.read_to_string(&mut contents).is_ok() {
+                if let Ok(cached) = serde_json::from_str::<PrInfo>(&contents) {
+                    if cached.base_branch == base_branch {
+                        return Some(cached);
+                    }
+                }
+            }
+        }
+    }
+
+    // Build locally
+    let files_changed = match get_files_changed(&base_branch) {
+        Ok(files) => files,
+        Err(e) => {
+            api::err_writeln(&format!("Failed to get files changed: {}", e));
+            Vec::new()
+        }
+    };
+
+    let pr_info = PrInfo {
+        pr_number,
+        title: None,
+        base_branch,
+        head_branch: None,
+        files_changed,
+    };
+
+    // Cache to disk
+    if let Ok(json) = serde_json::to_string(&pr_info) {
+        if let Ok(mut file) = File::create(&cache_path) {
+            let _ = file.write_all(json.as_bytes());
+        }
+    }
+
+    Some(pr_info)
+}
+
+/// Optionally fetch PR/MR info from the API for enrichment (title, head_branch).
+/// Returns None on any failure — this is never required.
+fn fetch_pr_info_from_api(config: &Config, pr_number: u32) -> Option<PrInfo> {
+    let base_branch = config
+        .base_branch
+        .as_deref()
+        .unwrap_or("main")
+        .to_string();
+
+    let (token_var, _) = match config.backend {
+        GitBackend::GitHub => ("GH_REVIEW_API_TOKEN", "GitHub"),
+        GitBackend::GitLab => ("GITLAB_TOKEN", "GitLab"),
+    };
+    let token = env::var(token_var).ok()?;
+
+    let client = reqwest::blocking::Client::new();
+
+    match config.backend {
+        GitBackend::GitHub => {
+            let url = format!(
+                "https://api.github.com/repos/{}/{}/pulls/{}",
+                config.owner, config.repo, pr_number
+            );
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                ACCEPT,
+                HeaderValue::from_static("application/vnd.github+json"),
+            );
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("token {}", token)).ok()?,
+            );
+            headers.insert(USER_AGENT, HeaderValue::from_static("vim-reviewer"));
+
+            let resp = client.get(&url).headers(headers).send().ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
+            let data: serde_json::Value = resp.json().ok()?;
+            let title = data["title"].as_str().map(|s| s.to_string());
+            let head_branch = data["head"]["ref"].as_str().map(|s| s.to_string());
+            let api_base = data["base"]["ref"]
+                .as_str()
+                .map(|s| s.to_string())
+                .unwrap_or(base_branch);
+
+            let files_changed = match get_files_changed(&api_base) {
+                Ok(f) => f,
+                Err(_) => Vec::new(),
+            };
+
+            Some(PrInfo {
+                pr_number,
+                title,
+                base_branch: api_base,
+                head_branch,
+                files_changed,
+            })
+        }
+        GitBackend::GitLab => {
+            let base_url = config
+                .backend_url
+                .as_deref()
+                .unwrap_or("https://gitlab.com");
+            let encoded_project =
+                format!("{}/{}", config.owner, config.repo).replace("/", "%2F");
+            let url = format!(
+                "{}/api/v4/projects/{}/merge_requests/{}",
+                base_url, encoded_project, pr_number
+            );
+
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {}", token)).ok()?,
+            );
+            headers.insert(USER_AGENT, HeaderValue::from_static("vim-reviewer"));
+
+            let resp = client.get(&url).headers(headers).send().ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
+            let data: serde_json::Value = resp.json().ok()?;
+            let title = data["title"].as_str().map(|s| s.to_string());
+            let head_branch = data["source_branch"].as_str().map(|s| s.to_string());
+            let api_base = data["target_branch"]
+                .as_str()
+                .map(|s| s.to_string())
+                .unwrap_or(base_branch);
+
+            let files_changed = match get_files_changed(&api_base) {
+                Ok(f) => f,
+                Err(_) => Vec::new(),
+            };
+
+            Some(PrInfo {
+                pr_number,
+                title,
+                base_branch: api_base,
+                head_branch,
+                files_changed,
+            })
+        }
+    }
+}
+
+/// Format a status char for display (e.g. "M" -> "M", "A" -> "A").
+fn format_file_status_char(status: &str) -> &str {
+    match status {
+        "A" => "A",
+        "D" => "D",
+        "M" => "M",
+        "R" => "R",
+        "C" => "C",
+        _ => "?",
+    }
+}
+
+/// Build the status buffer lines and their associated actions.
+fn build_status_lines(
+    pr_number: u32,
+    pr_info: &PrInfo,
+    review: Option<&Review>,
+) -> (Vec<String>, Vec<StatusLineAction>) {
+    let mut lines: Vec<String> = Vec::new();
+    let mut actions: Vec<StatusLineAction> = Vec::new();
+
+    // Header
+    let title_str = match &pr_info.title {
+        Some(t) => format!(" - {}", t),
+        None => String::new(),
+    };
+    lines.push(format!("== Review #{}{} ==", pr_number, title_str));
+    actions.push(StatusLineAction::None);
+
+    lines.push(String::new());
+    actions.push(StatusLineAction::None);
+
+    lines.push(format!("Base: {}", pr_info.base_branch));
+    actions.push(StatusLineAction::None);
+
+    if let Some(ref head) = pr_info.head_branch {
+        lines.push(format!("Head: {}", head));
+        actions.push(StatusLineAction::None);
+    }
+
+    lines.push("Status: Review in progress".to_string());
+    actions.push(StatusLineAction::None);
+
+    lines.push(String::new());
+    actions.push(StatusLineAction::None);
+
+    // Files changed section
+    lines.push(format!(
+        "Files changed ({}):",
+        pr_info.files_changed.len()
+    ));
+    actions.push(StatusLineAction::None);
+
+    let separator = "\u{2500}".repeat(50);
+    lines.push(separator.clone());
+    actions.push(StatusLineAction::None);
+
+    let comments = review.map(|r| &r.comments).cloned().unwrap_or_default();
+
+    let expanded = EXPANDED_COMMENTS.with(|e| e.borrow().clone());
+
+    let mut comment_global_idx: usize = 0;
+
+    for fc in &pr_info.files_changed {
+        let stat_display = format!("+{} -{}", fc.additions, fc.deletions);
+        lines.push(format!(
+            "  {} {:<40} | {}",
+            format_file_status_char(&fc.status),
+            fc.path,
+            stat_display
+        ));
+        actions.push(StatusLineAction::OpenFile(fc.path.clone()));
+
+        // Find comments for this file
+        let file_comments: Vec<(usize, &Comment)> = comments
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.path == fc.path)
+            .collect();
+
+        for (_review_comment_idx, comment) in &file_comments {
+            let line_display = match comment.start_line {
+                Some(sl) if sl != comment.line => format!("L{}-{}", sl, comment.line),
+                _ => format!("L{}", comment.line),
+            };
+
+            if expanded.contains(&comment_global_idx) {
+                // Show full comment body (indented)
+                let header = format!("    [-] {} :", line_display);
+                lines.push(header);
+                actions.push(StatusLineAction::ToggleComment(comment_global_idx));
+                for body_line in comment.body.lines() {
+                    lines.push(format!("         {}", body_line));
+                    actions.push(StatusLineAction::JumpToComment(
+                        fc.path.clone(),
+                        comment.line,
+                    ));
+                }
+            } else {
+                // Collapsed: first 50 chars
+                let preview: String = comment
+                    .body
+                    .chars()
+                    .take(50)
+                    .collect::<String>()
+                    .replace('\n', " ");
+                let suffix = if comment.body.len() > 50 { "..." } else { "" };
+                lines.push(format!(
+                    "    [+] {} : {}{}",
+                    line_display, preview, suffix
+                ));
+                actions.push(StatusLineAction::ToggleComment(comment_global_idx));
+            }
+            comment_global_idx += 1;
+        }
+    }
+
+    // Separator before body
+    lines.push(String::new());
+    actions.push(StatusLineAction::None);
+    lines.push(separator);
+    actions.push(StatusLineAction::None);
+
+    // Review body
+    if let Some(review) = review {
+        if !review.body.is_empty() {
+            lines.push("Review body:".to_string());
+            actions.push(StatusLineAction::None);
+            for body_line in review.body.lines() {
+                lines.push(format!("  {}", body_line));
+                actions.push(StatusLineAction::None);
+            }
+        }
+    }
+
+    (lines, actions)
+}
+
+/// Install buffer-local keymaps for the status buffer.
+fn install_status_keymaps(buf_handle: i64) -> ApiResult<()> {
+    let keymaps = [
+        ("n", "<CR>", ":ReviewStatusEnter<CR>"),
+        ("n", "<Tab>", ":ReviewStatusTab<CR>"),
+        ("n", "q", ":bwipeout<CR>"),
+        ("n", "R", ":ReviewStatusRefresh<CR>"),
+    ];
+    for (_mode, lhs, rhs) in &keymaps {
+        api::command(&format!(
+            "nnoremap <buffer={}> <silent> {} {}",
+            buf_handle, lhs, rhs
+        ))?;
+    }
+    Ok(())
+}
+
+/// Open the status buffer (or focus it if already open).
+fn open_status_buffer(pr_number: u32) -> ApiResult<()> {
+    // Check if we already have a status buffer open
+    let existing = STATUS_BUFFER_HANDLE.with(|h| h.borrow().clone());
+    if let Some(ref buf) = existing {
+        // Check if the buffer is still valid
+        let obj: oxi::Object = buf.into();
+        let handle = unsafe { obj.as_integer_unchecked() };
+        if api::call_function::<_, bool>("bufexists", (handle,))? {
+            // Focus the existing buffer
+            api::command(&format!("sbuffer {}", handle))?;
+            refresh_status_buffer()?;
+            return Ok(());
+        }
+    }
+
+    // Create a new scratch buffer
+    let buf = api::create_buf(false, true)
+        .map_err(|_| api::Error::Other("Failed to create status buffer".to_string()))?;
+
+    let obj: oxi::Object = (&buf).into();
+    let handle = unsafe { obj.as_integer_unchecked() };
+
+    // Open as horizontal split at top
+    api::command(&format!("topleft sbuffer {}", handle))?;
+
+    // Set buffer options
+    api::command("setlocal buftype=nofile bufhidden=wipe noswapfile nomodifiable nonumber norelativenumber signcolumn=no")?;
+
+    // Set buffer name
+    api::command(&format!("file [Review\\ #{}]", pr_number))?;
+
+    // Store the handle
+    STATUS_BUFFER_HANDLE.with(|h| {
+        *h.borrow_mut() = Some(buf);
+    });
+
+    // Clear expanded comments
+    EXPANDED_COMMENTS.with(|e| e.borrow_mut().clear());
+
+    // Render content and install keymaps
+    refresh_status_buffer()?;
+    install_status_keymaps(handle)?;
+
+    Ok(())
+}
+
+/// Refresh the status buffer content by re-reading review data.
+fn refresh_status_buffer() -> ApiResult<()> {
+    let buf = STATUS_BUFFER_HANDLE.with(|h| h.borrow().clone());
+    let mut buf = match buf {
+        Some(b) => b,
+        None => return Ok(()),
+    };
+
+    let config = match get_config_from_file() {
+        Some(c) => c,
+        None => return Ok(()),
+    };
+
+    let pr_number = match config.active_pr {
+        Some(n) => n,
+        None => return Ok(()),
+    };
+
+    let pr_info = match get_or_build_pr_info(&config, pr_number) {
+        Some(info) => info,
+        None => return Ok(()),
+    };
+
+    let review = Review::get_review(pr_number);
+    let (lines, new_actions) = build_status_lines(pr_number, &pr_info, review.as_ref());
+
+    STATUS_LINE_ACTIONS.with(|a| {
+        *a.borrow_mut() = new_actions;
+    });
+
+    // Make buffer modifiable, write lines, make nomodifiable
+    api::command("setlocal modifiable")?;
+    let line_strs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+    buf.set_lines(0..=buf.line_count()?, false, line_strs)?;
+    api::command("setlocal nomodifiable")?;
+
+    Ok(())
+}
+
+#[test]
+fn test_build_status_lines_basic() {
+    let pr_info = PrInfo {
+        pr_number: 42,
+        title: Some("Fix the widget".to_string()),
+        base_branch: "main".to_string(),
+        head_branch: Some("fix-widget".to_string()),
+        files_changed: vec![
+            FileChange {
+                path: "src/lib.rs".to_string(),
+                additions: 10,
+                deletions: 3,
+                status: "M".to_string(),
+            },
+            FileChange {
+                path: "src/new.rs".to_string(),
+                additions: 50,
+                deletions: 0,
+                status: "A".to_string(),
+            },
+        ],
+    };
+
+    let (lines, actions) = build_status_lines(42, &pr_info, None);
+
+    // Header
+    assert!(lines[0].contains("Review #42"));
+    assert!(lines[0].contains("Fix the widget"));
+
+    // Base and head
+    assert!(lines.iter().any(|l| l.contains("Base: main")));
+    assert!(lines.iter().any(|l| l.contains("Head: fix-widget")));
+
+    // Files
+    assert!(lines.iter().any(|l| l.contains("Files changed (2):")));
+    assert!(lines.iter().any(|l| l.contains("M src/lib.rs")));
+    assert!(lines.iter().any(|l| l.contains("A src/new.rs")));
+    assert!(lines.iter().any(|l| l.contains("+10 -3")));
+
+    // Actions length matches lines length
+    assert_eq!(lines.len(), actions.len());
+}
+
+#[test]
+fn test_build_status_lines_with_comments() {
+    let pr_info = PrInfo {
+        pr_number: 7,
+        title: None,
+        base_branch: "main".to_string(),
+        head_branch: None,
+        files_changed: vec![FileChange {
+            path: "src/lib.rs".to_string(),
+            additions: 5,
+            deletions: 2,
+            status: "M".to_string(),
+        }],
+    };
+
+    let review = Review {
+        owner: "test".to_string(),
+        repo: "repo".to_string(),
+        backend: GitBackend::GitHub,
+        backend_url: None,
+        pr_number: 7,
+        body: "Looks good overall".to_string(),
+        comments: vec![Comment::new(
+            "Please rename this variable".to_string(),
+            42,
+            "src/lib.rs".to_string(),
+            Side::RIGHT,
+            None,
+            None,
+        )],
+        in_progress_comment: None,
+    };
+
+    let (lines, actions) = build_status_lines(7, &pr_info, Some(&review));
+
+    // Should have a collapsed comment line
+    assert!(lines.iter().any(|l| l.contains("[+] L42")));
+    assert!(lines
+        .iter()
+        .any(|l| l.contains("Please rename this variable")));
+
+    // Should have review body
+    assert!(lines.iter().any(|l| l.contains("Review body:")));
+    assert!(lines
+        .iter()
+        .any(|l| l.contains("Looks good overall")));
+
+    assert_eq!(lines.len(), actions.len());
+}
+
+#[test]
+fn test_file_change_serialization() {
+    let fc = FileChange {
+        path: "src/main.rs".to_string(),
+        additions: 10,
+        deletions: 5,
+        status: "M".to_string(),
+    };
+    let json = serde_json::to_string(&fc).unwrap();
+    let deserialized: FileChange = serde_json::from_str(&json).unwrap();
+    assert_eq!(deserialized.path, "src/main.rs");
+    assert_eq!(deserialized.additions, 10);
+    assert_eq!(deserialized.deletions, 5);
+    assert_eq!(deserialized.status, "M");
+}
+
+#[test]
+fn test_pr_info_serialization() {
+    let pr_info = PrInfo {
+        pr_number: 1,
+        title: Some("Test PR".to_string()),
+        base_branch: "main".to_string(),
+        head_branch: Some("feature".to_string()),
+        files_changed: vec![],
+    };
+    let json = serde_json::to_string(&pr_info).unwrap();
+    let deserialized: PrInfo = serde_json::from_str(&json).unwrap();
+    assert_eq!(deserialized.pr_number, 1);
+    assert_eq!(deserialized.title, Some("Test PR".to_string()));
+    assert_eq!(deserialized.base_branch, "main");
+}
+
 #[test]
 fn test_environment_detection() {
     let repo = Repository::open_from_env().unwrap();
@@ -790,6 +1601,8 @@ pub struct Config {
     #[serde(default)]
     backend_url: Option<String>, // Base URL for the backend (e.g., "https://gitlab.example.com")
     active_pr: Option<u32>,
+    #[serde(default)]
+    base_branch: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Clone, Copy, Debug)]
@@ -826,6 +1639,23 @@ impl Comment {
             start_side,
         }
     }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct FileChange {
+    path: String,
+    additions: u32,
+    deletions: u32,
+    status: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PrInfo {
+    pr_number: u32,
+    title: Option<String>,
+    base_branch: String,
+    head_branch: Option<String>,
+    files_changed: Vec<FileChange>,
 }
 
 #[derive(Serialize, Deserialize)]
