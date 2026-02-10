@@ -1317,7 +1317,7 @@ fn build_status_lines(
 }
 
 /// Install buffer-local keymaps for the status buffer.
-fn install_status_keymaps(buf_handle: i64) -> ApiResult<()> {
+fn install_status_keymaps() -> ApiResult<()> {
     let keymaps = [
         ("n", "<CR>", ":ReviewStatusEnter<CR>"),
         ("n", "<Tab>", ":ReviewStatusTab<CR>"),
@@ -1326,8 +1326,8 @@ fn install_status_keymaps(buf_handle: i64) -> ApiResult<()> {
     ];
     for (_mode, lhs, rhs) in &keymaps {
         api::command(&format!(
-            "nnoremap <buffer={}> <silent> {} {}",
-            buf_handle, lhs, rhs
+            "nnoremap <buffer> <silent> {} {}",
+            lhs, rhs
         ))?;
     }
     Ok(())
@@ -1341,7 +1341,7 @@ fn open_status_buffer(pr_number: u32) -> ApiResult<()> {
         // Check if the buffer is still valid
         let obj: oxi::Object = buf.into();
         let handle = unsafe { obj.as_integer_unchecked() };
-        if api::call_function::<_, bool>("bufexists", (handle,))? {
+        if api::call_function::<_, i32>("bufexists", (handle,))? != 0 {
             // Focus the existing buffer
             api::command(&format!("sbuffer {}", handle))?;
             refresh_status_buffer()?;
@@ -1362,8 +1362,8 @@ fn open_status_buffer(pr_number: u32) -> ApiResult<()> {
     // Set buffer options
     api::command("setlocal buftype=nofile bufhidden=wipe noswapfile nomodifiable nonumber norelativenumber signcolumn=no")?;
 
-    // Set buffer name
-    api::command(&format!("file [Review\\ #{}]", pr_number))?;
+    // Set buffer name (escape # to prevent neovim command-line expansion)
+    api::command(&format!("file [Review\\ \\#{}]", pr_number))?;
 
     // Store the handle
     STATUS_BUFFER_HANDLE.with(|h| {
@@ -1375,7 +1375,7 @@ fn open_status_buffer(pr_number: u32) -> ApiResult<()> {
 
     // Render content and install keymaps
     refresh_status_buffer()?;
-    install_status_keymaps(handle)?;
+    install_status_keymaps()?;
 
     Ok(())
 }
@@ -1413,7 +1413,7 @@ fn refresh_status_buffer() -> ApiResult<()> {
     // Make buffer modifiable, write lines, make nomodifiable
     api::command("setlocal modifiable")?;
     let line_strs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
-    buf.set_lines(0..=buf.line_count()?, false, line_strs)?;
+    buf.set_lines(.., false, line_strs)?;
     api::command("setlocal nomodifiable")?;
 
     Ok(())
