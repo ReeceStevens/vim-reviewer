@@ -1333,6 +1333,55 @@ fn install_status_keymaps() -> ApiResult<()> {
     Ok(())
 }
 
+/// Apply syntax highlighting rules to the current status buffer.
+fn install_status_syntax() -> ApiResult<()> {
+    let rules = [
+        // Title line: == Review #19 - Fix the widget ==
+        r#"syn match reviewStatusTitle /^== .\+ ==$/"#,
+        // Key-value headers: Base: main, Head: fix-widget, Status: ...
+        r#"syn match reviewStatusHeader /^\(Base\|Head\|Status\):/ nextgroup=reviewStatusBranch skipwhite"#,
+        r#"syn match reviewStatusBranch /.*/ contained"#,
+        // Section headings: Files changed (3):, Review body:
+        r#"syn match reviewStatusHeading /^Files changed\ze\s\+(\d\+):/ nextgroup=reviewStatusCount skipwhite"#,
+        r#"syn match reviewStatusHeading /^Review body:/"#,
+        r#"syn match reviewStatusCount /(\d\+)/hs=s+1,he=e-1 contained"#,
+        // Separator: ─────────
+        r#"syn match reviewStatusSeparator /^─\+$/"#,
+        // File entry: "  M src/lib.rs                | +45 -12"
+        r#"syn match reviewStatusFile /^\s\+[MADRC?]\s.\+|/ contains=reviewStatusModifier,reviewStatusPath,reviewStatusPipe"#,
+        r#"syn match reviewStatusModifier /[MADRC?]/ contained"#,
+        r#"syn match reviewStatusPath /[MADRC?]\@<=\s\+\S\+/ contained"#,
+        r#"syn match reviewStatusPipe /|/ contained"#,
+        // Diff stats: +45, -12
+        r#"syn match reviewStatusAdd /|\s\+\zs+\d\+/ containedin=reviewStatusFile"#,
+        r#"syn match reviewStatusDelete /|\s\++\d\+\s\+\zs-\d\+/ containedin=reviewStatusFile"#,
+        // Comment toggle and line refs
+        r#"syn match reviewStatusToggle /\[[-+]\]/"#,
+        r#"syn match reviewStatusLineRef /L\d\+\(-\d\+\)\=/"#,
+        // Comment body (9-space indent)
+        r#"syn match reviewStatusCommentBody /^\s\{9\}.\+$/"#,
+        // Highlight links
+        "hi def link reviewStatusTitle Title",
+        "hi def link reviewStatusHeader Label",
+        "hi def link reviewStatusBranch Function",
+        "hi def link reviewStatusHeading PreProc",
+        "hi def link reviewStatusCount Number",
+        "hi def link reviewStatusSeparator Comment",
+        "hi def link reviewStatusModifier Type",
+        "hi def link reviewStatusPath Directory",
+        "hi def link reviewStatusPipe Comment",
+        "hi def link reviewStatusAdd diffAdded",
+        "hi def link reviewStatusDelete diffRemoved",
+        "hi def link reviewStatusToggle Special",
+        "hi def link reviewStatusLineRef Number",
+        "hi def link reviewStatusCommentBody Comment",
+    ];
+    for rule in &rules {
+        api::command(rule)?;
+    }
+    Ok(())
+}
+
 /// Open the status buffer (or focus it if already open).
 fn open_status_buffer(pr_number: u32) -> ApiResult<()> {
     // Check if we already have a status buffer open
@@ -1373,9 +1422,10 @@ fn open_status_buffer(pr_number: u32) -> ApiResult<()> {
     // Clear expanded comments
     EXPANDED_COMMENTS.with(|e| e.borrow_mut().clear());
 
-    // Render content and install keymaps
+    // Render content, install keymaps, and apply syntax highlighting
     refresh_status_buffer()?;
     install_status_keymaps()?;
+    install_status_syntax()?;
 
     Ok(())
 }
