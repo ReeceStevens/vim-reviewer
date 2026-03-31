@@ -9,12 +9,12 @@ extern crate toml;
 
 use git2::Repository;
 use nvim_oxi::api;
-use nvim_oxi::api::opts::{CmdOpts, CreateCommandOpts};
-use nvim_oxi::api::types::{CmdInfos, CommandArgs, CommandNArgs, CommandRange};
+use nvim_oxi::api::opts::CreateCommandOpts;
+use nvim_oxi::api::types::{CommandArgs, CommandNArgs, CommandRange};
 use nvim_oxi::string;
 use nvim_oxi::{self as oxi, Array, Dictionary, Object};
 use regex::Regex;
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
+use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use tempfile::NamedTempFile;
@@ -51,8 +51,8 @@ enum StatusLineAction {
 
 thread_local! {
     static EXPANDED_COMMENTS: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
-    static STATUS_BUFFER_HANDLE: RefCell<Option<nvim_oxi::api::Buffer>> = RefCell::new(None);
-    static STATUS_LINE_ACTIONS: RefCell<Vec<StatusLineAction>> = RefCell::new(Vec::new());
+    static STATUS_BUFFER_HANDLE: RefCell<Option<nvim_oxi::api::Buffer>> = const { RefCell::new(None) };
+    static STATUS_LINE_ACTIONS: RefCell<Vec<StatusLineAction>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Git backend type (GitHub or GitLab)
@@ -339,10 +339,10 @@ fn vim_reviewer() -> oxi::Result<()> {
         "UpdateReviewSigns",
         "Update the gutter symbols for review comments",
         CommandNArgs::ZeroOrOne,
-        |args: CommandArgs| -> ApiResult<()> {
+        |_args: CommandArgs| -> ApiResult<()> {
             let review = get_current_review();
             match review {
-                None => return Ok(()),
+                None => Ok(()),
                 Some(review) => {
                     let mut sign_idx = 0;
                     api::command("sign unplace * group=PrReviewSigns")?;
@@ -358,9 +358,7 @@ fn vim_reviewer() -> oxi::Result<()> {
                             let comments_in_buffer: Vec<&Comment> = review
                                 .comments
                                 .iter()
-                                .filter(|comment| {
-                                    comment.path == buffer_path.to_str().unwrap().to_string()
-                                })
+                                .filter(|comment| comment.path == buffer_path.to_str().unwrap())
                                 .collect();
                             for comment in comments_in_buffer {
                                 let start_line = comment.start_line.unwrap_or(comment.line);
@@ -374,11 +372,9 @@ fn vim_reviewer() -> oxi::Result<()> {
                                 for line in start_line..=end_line {
                                     sign_idx += 1;
                                     let command = format!(
-                                    "sign place {} line={} name=PrReviewComment group=PrReviewSigns buffer={}",
-                                    sign_idx,
-                                    line,
-                                    handle,
-                                );
+                                        "sign place {} line={} name=PrReviewComment group=PrReviewSigns buffer={}",
+                                        sign_idx, line, handle,
+                                    );
                                     api::command(&command)?;
                                 }
                             }
@@ -398,7 +394,7 @@ fn vim_reviewer() -> oxi::Result<()> {
             match get_config_from_file() {
                 None => {
                     api::err_writeln("Could not read configuration file.");
-                    return Ok(());
+                    Ok(())
                 }
                 Some(mut config) => {
                     let raw = args.args.unwrap_or_default();
@@ -426,16 +422,14 @@ fn vim_reviewer() -> oxi::Result<()> {
                     update_configuration(config);
 
                     // Optionally try API fetch for enrichment
-                    if let Some(config) = get_config_from_file() {
-                        if let Some(pr_info) = fetch_pr_info_from_api(&config, pr_number) {
-                            // Cache the enriched info
-                            if let Ok(json) = serde_json::to_string(&pr_info) {
-                                if let Ok(mut file) =
-                                    File::create(get_pr_info_cache_path(pr_number))
-                                {
-                                    let _ = file.write_all(json.as_bytes());
-                                }
-                            }
+                    if let Some(config) = get_config_from_file()
+                        && let Some(pr_info) = fetch_pr_info_from_api(&config, pr_number)
+                    {
+                        // Cache the enriched info
+                        if let Ok(json) = serde_json::to_string(&pr_info)
+                            && let Ok(mut file) = File::create(get_pr_info_cache_path(pr_number))
+                        {
+                            let _ = file.write_all(json.as_bytes());
                         }
                     }
 
@@ -549,7 +543,7 @@ fn vim_reviewer() -> oxi::Result<()> {
         CommandNArgs::ZeroOrOne,
         |args: CommandArgs| -> ApiResult<()> {
             let command_args = args.args.unwrap_or("".to_string());
-            let is_new_comment = command_args == "new".to_string();
+            let is_new_comment = command_args == "new";
             let review = get_current_review();
             match review {
                 None => {
@@ -694,7 +688,7 @@ fn vim_reviewer() -> oxi::Result<()> {
         "QuickfixAllComments",
         "Load all review comments into the quickfix list",
         CommandNArgs::ZeroOrOne,
-        |args: CommandArgs| -> ApiResult<()> {
+        |_args: CommandArgs| -> ApiResult<()> {
             let review = get_current_review();
             match review {
                 None => {
@@ -751,11 +745,11 @@ fn vim_reviewer() -> oxi::Result<()> {
         CommandNArgs::ZeroOrOne,
         |_args: CommandArgs| -> ApiResult<()> {
             // Invalidate PrInfo cache so files are re-computed from git
-            if let Some(config) = get_config_from_file() {
-                if let Some(pr_number) = config.active_pr {
-                    let cache_path = get_pr_info_cache_path(pr_number);
-                    let _ = std::fs::remove_file(&cache_path);
-                }
+            if let Some(config) = get_config_from_file()
+                && let Some(pr_number) = config.active_pr
+            {
+                let cache_path = get_pr_info_cache_path(pr_number);
+                let _ = std::fs::remove_file(&cache_path);
             }
             refresh_status_buffer()?;
             Ok(())
@@ -786,18 +780,18 @@ fn vim_reviewer() -> oxi::Result<()> {
                     // Move to window below, open file, run diff
                     api::command("wincmd j")?;
                     api::command(&format!("edit {}", path))?;
-                    let diff_cmd =
-                        format!("Gvdiffsplit origin/{}", base_branch);
-                    if let Err(_) = api::command(&diff_cmd) {
+                    let diff_cmd = format!("Gvdiffsplit origin/{}", base_branch);
+                    if api::command(&diff_cmd).is_err() {
                         // Fallback: just open the file without diff
-                        api::err_writeln("Could not open fugitive diff. Is vim-fugitive installed?");
+                        api::err_writeln(
+                            "Could not open fugitive diff. Is vim-fugitive installed?",
+                        );
                     }
                 }
                 Some(StatusLineAction::JumpToComment(path, line)) => {
                     api::command("wincmd j")?;
                     api::command(&format!("edit {}", path))?;
-                    let diff_cmd =
-                        format!("Gvdiffsplit origin/{}", base_branch);
+                    let diff_cmd = format!("Gvdiffsplit origin/{}", base_branch);
                     let _ = api::command(&diff_cmd);
                     api::command(&format!("{}", line))?;
                 }
@@ -833,21 +827,18 @@ fn vim_reviewer() -> oxi::Result<()> {
                 actions.get(line_idx).cloned()
             });
 
-            match action {
-                Some(StatusLineAction::ToggleComment(idx)) => {
-                    EXPANDED_COMMENTS.with(|e| {
-                        let mut set = e.borrow_mut();
-                        if set.contains(&idx) {
-                            set.remove(&idx);
-                        } else {
-                            set.insert(idx);
-                        }
-                    });
-                    let saved_cursor = api::get_current_win().get_cursor()?;
-                    refresh_status_buffer()?;
-                    let _ = api::get_current_win().set_cursor(saved_cursor.0, saved_cursor.1);
-                }
-                _ => {}
+            if let Some(StatusLineAction::ToggleComment(idx)) = action {
+                EXPANDED_COMMENTS.with(|e| {
+                    let mut set = e.borrow_mut();
+                    if set.contains(&idx) {
+                        set.remove(&idx);
+                    } else {
+                        set.insert(idx);
+                    }
+                });
+                let saved_cursor = api::get_current_win().get_cursor()?;
+                refresh_status_buffer()?;
+                let _ = api::get_current_win().set_cursor(saved_cursor.0, saved_cursor.1);
             }
             Ok(())
         }
@@ -870,11 +861,8 @@ fn new_temporary_buffer(on_save_command: Option<&str>) -> ApiResult<()> {
     let file = NamedTempFile::new().unwrap();
     api::command(&format!("sp {}", file.path().display()))?;
     api::command("set ft=markdown")?;
-    if on_save_command.is_some() {
-        api::command(&format!(
-            "autocmd BufWritePre <buffer> :{}",
-            on_save_command.unwrap()
-        ))?;
+    if let Some(cmd) = on_save_command {
+        api::command(&format!("autocmd BufWritePre <buffer> :{}", cmd))?;
     }
     Ok(())
 }
@@ -999,12 +987,12 @@ fn get_files_changed(base_branch: &str) -> Result<Vec<FileChange>, String> {
         let mut additions: u32 = 0;
         let mut deletions: u32 = 0;
 
-        if let Ok(patch) = git2::Patch::from_diff(&diff, idx) {
-            if let Some(ref patch) = patch {
-                let (_, adds, dels) = patch.line_stats().unwrap_or((0, 0, 0));
-                additions = adds as u32;
-                deletions = dels as u32;
-            }
+        if let Ok(patch) = git2::Patch::from_diff(&diff, idx)
+            && let Some(ref patch) = patch
+        {
+            let (_, adds, dels) = patch.line_stats().unwrap_or((0, 0, 0));
+            additions = adds as u32;
+            deletions = dels as u32;
         }
 
         files.push(FileChange {
@@ -1025,23 +1013,18 @@ fn get_pr_info_cache_path(pr_number: u32) -> PathBuf {
 /// Get or build PrInfo, using disk cache when available.
 fn get_or_build_pr_info(config: &Config, pr_number: u32) -> Option<PrInfo> {
     let cache_path = get_pr_info_cache_path(pr_number);
-    let base_branch = config
-        .base_branch
-        .as_deref()
-        .unwrap_or("main")
-        .to_string();
+    let base_branch = config.base_branch.as_deref().unwrap_or("main").to_string();
 
     // Try loading from cache
-    if cache_path.exists() {
-        if let Ok(mut file) = File::open(&cache_path) {
-            let mut contents = String::new();
-            if file.read_to_string(&mut contents).is_ok() {
-                if let Ok(cached) = serde_json::from_str::<PrInfo>(&contents) {
-                    if cached.base_branch == base_branch {
-                        return Some(cached);
-                    }
-                }
-            }
+    if cache_path.exists()
+        && let Ok(mut file) = File::open(&cache_path)
+    {
+        let mut contents = String::new();
+        if file.read_to_string(&mut contents).is_ok()
+            && let Ok(cached) = serde_json::from_str::<PrInfo>(&contents)
+            && cached.base_branch == base_branch
+        {
+            return Some(cached);
         }
     }
 
@@ -1063,10 +1046,10 @@ fn get_or_build_pr_info(config: &Config, pr_number: u32) -> Option<PrInfo> {
     };
 
     // Cache to disk
-    if let Ok(json) = serde_json::to_string(&pr_info) {
-        if let Ok(mut file) = File::create(&cache_path) {
-            let _ = file.write_all(json.as_bytes());
-        }
+    if let Ok(json) = serde_json::to_string(&pr_info)
+        && let Ok(mut file) = File::create(&cache_path)
+    {
+        let _ = file.write_all(json.as_bytes());
     }
 
     Some(pr_info)
@@ -1075,11 +1058,7 @@ fn get_or_build_pr_info(config: &Config, pr_number: u32) -> Option<PrInfo> {
 /// Optionally fetch PR/MR info from the API for enrichment (title, head_branch).
 /// Returns None on any failure — this is never required.
 fn fetch_pr_info_from_api(config: &Config, pr_number: u32) -> Option<PrInfo> {
-    let base_branch = config
-        .base_branch
-        .as_deref()
-        .unwrap_or("main")
-        .to_string();
+    let base_branch = config.base_branch.as_deref().unwrap_or("main").to_string();
 
     let (token_var, _) = match config.backend {
         GitBackend::GitHub => ("GH_REVIEW_API_TOKEN", "GitHub"),
@@ -1118,10 +1097,7 @@ fn fetch_pr_info_from_api(config: &Config, pr_number: u32) -> Option<PrInfo> {
                 .map(|s| s.to_string())
                 .unwrap_or(base_branch);
 
-            let files_changed = match get_files_changed(&api_base) {
-                Ok(f) => f,
-                Err(_) => Vec::new(),
-            };
+            let files_changed = get_files_changed(&api_base).unwrap_or_default();
 
             Some(PrInfo {
                 pr_number,
@@ -1136,8 +1112,7 @@ fn fetch_pr_info_from_api(config: &Config, pr_number: u32) -> Option<PrInfo> {
                 .backend_url
                 .as_deref()
                 .unwrap_or("https://gitlab.com");
-            let encoded_project =
-                format!("{}/{}", config.owner, config.repo).replace("/", "%2F");
+            let encoded_project = format!("{}/{}", config.owner, config.repo).replace("/", "%2F");
             let url = format!(
                 "{}/api/v4/projects/{}/merge_requests/{}",
                 base_url, encoded_project, pr_number
@@ -1162,10 +1137,7 @@ fn fetch_pr_info_from_api(config: &Config, pr_number: u32) -> Option<PrInfo> {
                 .map(|s| s.to_string())
                 .unwrap_or(base_branch);
 
-            let files_changed = match get_files_changed(&api_base) {
-                Ok(f) => f,
-                Err(_) => Vec::new(),
-            };
+            let files_changed = get_files_changed(&api_base).unwrap_or_default();
 
             Some(PrInfo {
                 pr_number,
@@ -1225,10 +1197,7 @@ fn build_status_lines(
     actions.push(StatusLineAction::None);
 
     // Files changed section
-    lines.push(format!(
-        "Files changed ({}):",
-        pr_info.files_changed.len()
-    ));
+    lines.push(format!("Files changed ({}):", pr_info.files_changed.len()));
     actions.push(StatusLineAction::None);
 
     let separator = "\u{2500}".repeat(50);
@@ -1285,10 +1254,7 @@ fn build_status_lines(
                     .collect::<String>()
                     .replace('\n', " ");
                 let suffix = if comment.body.len() > 50 { "..." } else { "" };
-                lines.push(format!(
-                    "    [+] {} : {}{}",
-                    line_display, preview, suffix
-                ));
+                lines.push(format!("    [+] {} : {}{}", line_display, preview, suffix));
                 actions.push(StatusLineAction::ToggleComment(comment_global_idx));
             }
             comment_global_idx += 1;
@@ -1302,14 +1268,14 @@ fn build_status_lines(
     actions.push(StatusLineAction::None);
 
     // Review body
-    if let Some(review) = review {
-        if !review.body.is_empty() {
-            lines.push("Review body:".to_string());
+    if let Some(review) = review
+        && !review.body.is_empty()
+    {
+        lines.push("Review body:".to_string());
+        actions.push(StatusLineAction::None);
+        for body_line in review.body.lines() {
+            lines.push(format!("  {}", body_line));
             actions.push(StatusLineAction::None);
-            for body_line in review.body.lines() {
-                lines.push(format!("  {}", body_line));
-                actions.push(StatusLineAction::None);
-            }
         }
     }
 
@@ -1325,10 +1291,7 @@ fn install_status_keymaps() -> ApiResult<()> {
         ("n", "R", ":ReviewStatusRefresh<CR>"),
     ];
     for (_mode, lhs, rhs) in &keymaps {
-        api::command(&format!(
-            "nnoremap <buffer> <silent> {} {}",
-            lhs, rhs
-        ))?;
+        api::command(&format!("nnoremap <buffer> <silent> {} {}", lhs, rhs))?;
     }
     Ok(())
 }
@@ -1409,7 +1372,9 @@ fn open_status_buffer(pr_number: u32) -> ApiResult<()> {
     api::command(&format!("topleft sbuffer {}", handle))?;
 
     // Set buffer options
-    api::command("setlocal buftype=nofile bufhidden=wipe noswapfile nomodifiable nonumber norelativenumber signcolumn=no")?;
+    api::command(
+        "setlocal buftype=nofile bufhidden=wipe noswapfile nomodifiable nonumber norelativenumber signcolumn=no",
+    )?;
 
     // Set buffer name (escape # to prevent neovim command-line expansion)
     api::command(&format!("file [Review\\ \\#{}]", pr_number))?;
@@ -1549,15 +1514,15 @@ fn test_build_status_lines_with_comments() {
 
     // Should have a collapsed comment line
     assert!(lines.iter().any(|l| l.contains("[+] L42")));
-    assert!(lines
-        .iter()
-        .any(|l| l.contains("Please rename this variable")));
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("Please rename this variable"))
+    );
 
     // Should have review body
     assert!(lines.iter().any(|l| l.contains("Review body:")));
-    assert!(lines
-        .iter()
-        .any(|l| l.contains("Looks good overall")));
+    assert!(lines.iter().any(|l| l.contains("Looks good overall")));
 
     assert_eq!(lines.len(), actions.len());
 }
@@ -1611,29 +1576,6 @@ fn test_current_buffer_path() {
         get_current_buffer_path(),
         Ok((Side::RIGHT, (Path::new("src/lib.rs").to_path_buf())))
     );
-}
-
-#[oxi::test]
-fn test_leave_two_comments() {
-    vim_reviewer().unwrap();
-    api::command("e src/lib.rs").unwrap();
-    api::command("StartReview 101").unwrap();
-    let opts = CmdOpts::builder().output(true).build();
-    let info = CmdInfos::builder()
-        .cmd("ReviewComment")
-        .range(api::types::CmdRange::Double(25, 28))
-        .build();
-    // api::command("25,28ReviewComment").unwrap();
-    api::cmd(&info, &opts).unwrap();
-    api::feedkeys(
-        string!("Test.").as_nvim_str(),
-        string!("i").as_nvim_str(),
-        false,
-    );
-    api::command("w").unwrap();
-    // api::command("50").unwrap();
-    // api::command("ReviewComment").unwrap();
-    // api::command("wq").unwrap();
 }
 
 /// Set the provided text as the contents of the current buffer
@@ -1806,11 +1748,7 @@ impl Review {
         }
 
         // Use the backend_url from config, or default to gitlab.com
-        let base_url = self
-            .backend_url
-            .as_ref()
-            .map(|s| s.as_str())
-            .unwrap_or("https://gitlab.com");
+        let base_url = self.backend_url.as_deref().unwrap_or("https://gitlab.com");
 
         let encoded_project = format!("{}/{}", self.owner, self.repo).replace("/", "%2F");
         let mut last_response: Option<reqwest::blocking::Response> = None;
@@ -1903,29 +1841,16 @@ impl Review {
 
             // Build position object
             // For multi-line comments, use line_range instead of new_line/old_line
-            let mut position = if is_multi_line {
-                serde_json::json!({
-                    "position_type": "text",
-                    "base_sha": base_sha,
-                    "start_sha": start_sha,
-                    "head_sha": head_sha,
-                    "new_path": new_path,
-                    "old_path": old_path,
-                    "new_line": new_line,
-                    "old_line": old_line,
-                })
-            } else {
-                serde_json::json!({
-                    "position_type": "text",
-                    "base_sha": base_sha,
-                    "start_sha": start_sha,
-                    "head_sha": head_sha,
-                    "new_path": new_path,
-                    "old_path": old_path,
-                    "new_line": new_line,
-                    "old_line": old_line,
-                })
-            };
+            let mut position = serde_json::json!({
+                "position_type": "text",
+                "base_sha": base_sha,
+                "start_sha": start_sha,
+                "head_sha": head_sha,
+                "new_path": new_path,
+                "old_path": old_path,
+                "new_line": new_line,
+                "old_line": old_line,
+            });
 
             // Add line_range for multi-line comments
             if is_multi_line {
@@ -2088,7 +2013,7 @@ impl Review {
             }
             Ok(file) => file,
         };
-        file.write_all(&serde_json::to_string(&self).unwrap().as_bytes())
+        file.write_all(serde_json::to_string(&self).unwrap().as_bytes())
             .unwrap();
     }
 
@@ -2100,14 +2025,14 @@ impl Review {
             .iter()
             .enumerate()
             .filter(|(_idx, comment)| {
-                return comment.path == path
+                comment.path == path
                     && (comment.line == line
                         || (comment.start_line.is_some()
                             && comment.start_line.unwrap() <= line
-                            && comment.line >= line));
+                            && comment.line >= line))
             })
             .collect();
-        if eligible_comments.len() > 0 {
+        if !eligible_comments.is_empty() {
             Some(eligible_comments[0])
         } else {
             None
@@ -2144,7 +2069,7 @@ impl Review {
             match get_config_from_file() {
                 None => {
                     api::err_writeln("Could not read configuration file.");
-                    return None;
+                    None
                 }
                 Some(config) => Some(Review::new(
                     config.owner.to_string(),
@@ -2166,7 +2091,7 @@ impl Review {
 /// If the line is only in the new file (added), old_line will be None
 fn get_line_mapping(
     repo: &Repository,
-    file_path: &str,
+    _file_path: &str,
     base_sha: &str,
     head_sha: &str,
     line_number: u32,
@@ -2201,17 +2126,7 @@ fn get_line_mapping(
     let mut line_map: Vec<(Option<u32>, Option<u32>)> = Vec::new();
 
     diff.foreach(
-        &mut |delta, _progress| {
-            let delta_path = delta
-                .new_file()
-                .path()
-                .unwrap_or(delta.old_file().path().unwrap());
-            if delta_path.to_str() == Some(file_path) {
-                true
-            } else {
-                true
-            }
-        },
+        &mut |_delta, _progress| true,
         None,
         None,
         Some(&mut |_delta, _hunk, line| {
@@ -2240,17 +2155,17 @@ fn get_line_mapping(
     for (old_line, new_line) in &line_map {
         if side == Side::LEFT {
             // Looking for old line number
-            if let Some(old) = old_line {
-                if *old == line_number {
-                    return Ok((*old_line, *new_line));
-                }
+            if let Some(old) = old_line
+                && *old == line_number
+            {
+                return Ok((*old_line, *new_line));
             }
         } else {
             // Looking for new line number
-            if let Some(new) = new_line {
-                if *new == line_number {
-                    return Ok((*old_line, *new_line));
-                }
+            if let Some(new) = new_line
+                && *new == line_number
+            {
+                return Ok((*old_line, *new_line));
             }
         }
     }
@@ -2269,7 +2184,7 @@ fn get_review_directory() -> PathBuf {
     let git_dir = Path::new(git_output.trim());
     let review_dir = git_dir.join(Path::new("reviews"));
     std::fs::create_dir_all(&review_dir).unwrap();
-    return review_dir;
+    review_dir
 }
 
 fn get_review_file_path(pr_number: u32) -> PathBuf {
@@ -2313,6 +2228,6 @@ pub fn update_configuration(config: Config) {
         }
         Ok(file) => file,
     };
-    file.write_all(&serde_json::to_string(&config).unwrap().as_bytes())
+    file.write_all(serde_json::to_string(&config).unwrap().as_bytes())
         .unwrap();
 }
