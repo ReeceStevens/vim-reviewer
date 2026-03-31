@@ -1,0 +1,20 @@
+# Example vim-reviewer.toml configuration file
+# Copy this file to vim-reviewer.toml and fill in your actual values
+# IMPORTANT: Add vim-reviewer.toml to your .gitignore to avoid committing your token!
+
+[backend]
+# Backend type: "github", "gitlab", or "local"
+type = "gitlab"
+
+# (Optional) Repository URL - if omitted, the plugin will detect from git remote
+# Not required for "local" backend.
+# Examples:
+#   GitHub: "https://github.com/owner/repo"
+#   GitLab: "https://gitlab.com/owner/repo"
+#   Custom GitLab: "https://gitlab.example.com/owner/repo"
+url = "https://gitlab.example.com/owner/repo"
+
+# API token for authentication (not required for "local" backend)
+# GitHub: Create at https://github.com/settings/tokens (requires 'repo' scope)
+# GitLab: Create at https://gitlab.com/-/user_settings/personal_access_tokens (requires 'api' scope)
+token = "your-api-token-here"
