@@ -9,8 +9,8 @@ extern crate toml;
 
 use git2::Repository;
 use nvim_oxi::api;
-use nvim_oxi::api::opts::{CmdOpts, CreateCommandOpts};
-use nvim_oxi::api::types::{CmdInfos, CommandArgs, CommandNArgs, CommandRange};
+use nvim_oxi::api::opts::CreateCommandOpts;
+use nvim_oxi::api::types::{CommandArgs, CommandNArgs, CommandRange};
 use nvim_oxi::string;
 use nvim_oxi::{self as oxi, Array, Dictionary, Object};
 use regex::Regex;
@@ -51,8 +51,8 @@ enum StatusLineAction {
 
 thread_local! {
     static EXPANDED_COMMENTS: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
-    static STATUS_BUFFER_HANDLE: RefCell<Option<nvim_oxi::api::Buffer>> = RefCell::new(None);
-    static STATUS_LINE_ACTIONS: RefCell<Vec<StatusLineAction>> = RefCell::new(Vec::new());
+    static STATUS_BUFFER_HANDLE: RefCell<Option<nvim_oxi::api::Buffer>> = const { RefCell::new(None) };
+    static STATUS_LINE_ACTIONS: RefCell<Vec<StatusLineAction>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Git backend type (GitHub or GitLab)
@@ -339,10 +339,10 @@ fn vim_reviewer() -> oxi::Result<()> {
         "UpdateReviewSigns",
         "Update the gutter symbols for review comments",
         CommandNArgs::ZeroOrOne,
-        |args: CommandArgs| -> ApiResult<()> {
+        |_args: CommandArgs| -> ApiResult<()> {
             let review = get_current_review();
             match review {
-                None => return Ok(()),
+                None => Ok(()),
                 Some(review) => {
                     let mut sign_idx = 0;
                     api::command("sign unplace * group=PrReviewSigns")?;
@@ -359,7 +359,7 @@ fn vim_reviewer() -> oxi::Result<()> {
                                 .comments
                                 .iter()
                                 .filter(|comment| {
-                                    comment.path == buffer_path.to_str().unwrap().to_string()
+                                    comment.path == buffer_path.to_str().unwrap()
                                 })
                                 .collect();
                             for comment in comments_in_buffer {
@@ -396,7 +396,7 @@ fn vim_reviewer() -> oxi::Result<()> {
             match get_config_from_file() {
                 None => {
                     api::err_writeln("Could not read configuration file.");
-                    return Ok(());
+                    Ok(())
                 }
                 Some(mut config) => {
                     let raw = args.args.unwrap_or_default();
@@ -424,18 +424,16 @@ fn vim_reviewer() -> oxi::Result<()> {
                     update_configuration(config);
 
                     // Optionally try API fetch for enrichment
-                    if let Some(config) = get_config_from_file() {
-                        if let Some(pr_info) = fetch_pr_info_from_api(&config, pr_number) {
+                    if let Some(config) = get_config_from_file()
+                        && let Some(pr_info) = fetch_pr_info_from_api(&config, pr_number) {
                             // Cache the enriched info
-                            if let Ok(json) = serde_json::to_string(&pr_info) {
-                                if let Ok(mut file) =
+                            if let Ok(json) = serde_json::to_string(&pr_info)
+                                && let Ok(mut file) =
                                     File::create(get_pr_info_cache_path(pr_number))
                                 {
                                     let _ = file.write_all(json.as_bytes());
                                 }
-                            }
                         }
-                    }
 
                     Ok(())
                 }
@@ -547,7 +545,7 @@ fn vim_reviewer() -> oxi::Result<()> {
         CommandNArgs::ZeroOrOne,
         |args: CommandArgs| -> ApiResult<()> {
             let command_args = args.args.unwrap_or("".to_string());
-            let is_new_comment = command_args == "new".to_string();
+            let is_new_comment = command_args == "new";
             let review = get_current_review();
             match review {
                 None => {
@@ -692,7 +690,7 @@ fn vim_reviewer() -> oxi::Result<()> {
         "QuickfixAllComments",
         "Load all review comments into the quickfix list",
         CommandNArgs::ZeroOrOne,
-        |args: CommandArgs| -> ApiResult<()> {
+        |_args: CommandArgs| -> ApiResult<()> {
             let review = get_current_review();
             match review {
                 None => {
@@ -749,12 +747,11 @@ fn vim_reviewer() -> oxi::Result<()> {
         CommandNArgs::ZeroOrOne,
         |_args: CommandArgs| -> ApiResult<()> {
             // Invalidate PrInfo cache so files are re-computed from git
-            if let Some(config) = get_config_from_file() {
-                if let Some(pr_number) = config.active_pr {
+            if let Some(config) = get_config_from_file()
+                && let Some(pr_number) = config.active_pr {
                     let cache_path = get_pr_info_cache_path(pr_number);
                     let _ = std::fs::remove_file(&cache_path);
                 }
-            }
             refresh_status_buffer()?;
             Ok(())
         }
@@ -785,7 +782,7 @@ fn vim_reviewer() -> oxi::Result<()> {
                     api::command("wincmd j")?;
                     api::command(&format!("edit {}", path))?;
                     let diff_cmd = format!("Gvdiffsplit origin/{}", base_branch);
-                    if let Err(_) = api::command(&diff_cmd) {
+                    if api::command(&diff_cmd).is_err() {
                         // Fallback: just open the file without diff
                         api::err_writeln(
                             "Could not open fugitive diff. Is vim-fugitive installed?",
@@ -831,21 +828,18 @@ fn vim_reviewer() -> oxi::Result<()> {
                 actions.get(line_idx).cloned()
             });
 
-            match action {
-                Some(StatusLineAction::ToggleComment(idx)) => {
-                    EXPANDED_COMMENTS.with(|e| {
-                        let mut set = e.borrow_mut();
-                        if set.contains(&idx) {
-                            set.remove(&idx);
-                        } else {
-                            set.insert(idx);
-                        }
-                    });
-                    let saved_cursor = api::get_current_win().get_cursor()?;
-                    refresh_status_buffer()?;
-                    let _ = api::get_current_win().set_cursor(saved_cursor.0, saved_cursor.1);
-                }
-                _ => {}
+            if let Some(StatusLineAction::ToggleComment(idx)) = action {
+                EXPANDED_COMMENTS.with(|e| {
+                    let mut set = e.borrow_mut();
+                    if set.contains(&idx) {
+                        set.remove(&idx);
+                    } else {
+                        set.insert(idx);
+                    }
+                });
+                let saved_cursor = api::get_current_win().get_cursor()?;
+                refresh_status_buffer()?;
+                let _ = api::get_current_win().set_cursor(saved_cursor.0, saved_cursor.1);
             }
             Ok(())
         }
@@ -997,13 +991,12 @@ fn get_files_changed(base_branch: &str) -> Result<Vec<FileChange>, String> {
         let mut additions: u32 = 0;
         let mut deletions: u32 = 0;
 
-        if let Ok(patch) = git2::Patch::from_diff(&diff, idx) {
-            if let Some(ref patch) = patch {
+        if let Ok(patch) = git2::Patch::from_diff(&diff, idx)
+            && let Some(ref patch) = patch {
                 let (_, adds, dels) = patch.line_stats().unwrap_or((0, 0, 0));
                 additions = adds as u32;
                 deletions = dels as u32;
             }
-        }
 
         files.push(FileChange {
             path,
@@ -1026,18 +1019,15 @@ fn get_or_build_pr_info(config: &Config, pr_number: u32) -> Option<PrInfo> {
     let base_branch = config.base_branch.as_deref().unwrap_or("main").to_string();
 
     // Try loading from cache
-    if cache_path.exists() {
-        if let Ok(mut file) = File::open(&cache_path) {
+    if cache_path.exists()
+        && let Ok(mut file) = File::open(&cache_path) {
             let mut contents = String::new();
-            if file.read_to_string(&mut contents).is_ok() {
-                if let Ok(cached) = serde_json::from_str::<PrInfo>(&contents) {
-                    if cached.base_branch == base_branch {
+            if file.read_to_string(&mut contents).is_ok()
+                && let Ok(cached) = serde_json::from_str::<PrInfo>(&contents)
+                    && cached.base_branch == base_branch {
                         return Some(cached);
                     }
-                }
-            }
         }
-    }
 
     // Build locally
     let files_changed = match get_files_changed(&base_branch) {
@@ -1057,11 +1047,10 @@ fn get_or_build_pr_info(config: &Config, pr_number: u32) -> Option<PrInfo> {
     };
 
     // Cache to disk
-    if let Ok(json) = serde_json::to_string(&pr_info) {
-        if let Ok(mut file) = File::create(&cache_path) {
+    if let Ok(json) = serde_json::to_string(&pr_info)
+        && let Ok(mut file) = File::create(&cache_path) {
             let _ = file.write_all(json.as_bytes());
         }
-    }
 
     Some(pr_info)
 }
@@ -1108,10 +1097,7 @@ fn fetch_pr_info_from_api(config: &Config, pr_number: u32) -> Option<PrInfo> {
                 .map(|s| s.to_string())
                 .unwrap_or(base_branch);
 
-            let files_changed = match get_files_changed(&api_base) {
-                Ok(f) => f,
-                Err(_) => Vec::new(),
-            };
+            let files_changed = get_files_changed(&api_base).unwrap_or_default();
 
             Some(PrInfo {
                 pr_number,
@@ -1151,10 +1137,7 @@ fn fetch_pr_info_from_api(config: &Config, pr_number: u32) -> Option<PrInfo> {
                 .map(|s| s.to_string())
                 .unwrap_or(base_branch);
 
-            let files_changed = match get_files_changed(&api_base) {
-                Ok(f) => f,
-                Err(_) => Vec::new(),
-            };
+            let files_changed = get_files_changed(&api_base).unwrap_or_default();
 
             Some(PrInfo {
                 pr_number,
@@ -1285,8 +1268,8 @@ fn build_status_lines(
     actions.push(StatusLineAction::None);
 
     // Review body
-    if let Some(review) = review {
-        if !review.body.is_empty() {
+    if let Some(review) = review
+        && !review.body.is_empty() {
             lines.push("Review body:".to_string());
             actions.push(StatusLineAction::None);
             for body_line in review.body.lines() {
@@ -1294,7 +1277,6 @@ fn build_status_lines(
                 actions.push(StatusLineAction::None);
             }
         }
-    }
 
     (lines, actions)
 }
@@ -1766,9 +1748,7 @@ impl Review {
 
         // Use the backend_url from config, or default to gitlab.com
         let base_url = self
-            .backend_url
-            .as_ref()
-            .map(|s| s.as_str())
+            .backend_url.as_deref()
             .unwrap_or("https://gitlab.com");
 
         let encoded_project = format!("{}/{}", self.owner, self.repo).replace("/", "%2F");
@@ -1862,8 +1842,7 @@ impl Review {
 
             // Build position object
             // For multi-line comments, use line_range instead of new_line/old_line
-            let mut position = if is_multi_line {
-                serde_json::json!({
+            let mut position = serde_json::json!({
                     "position_type": "text",
                     "base_sha": base_sha,
                     "start_sha": start_sha,
@@ -1872,19 +1851,7 @@ impl Review {
                     "old_path": old_path,
                     "new_line": new_line,
                     "old_line": old_line,
-                })
-            } else {
-                serde_json::json!({
-                    "position_type": "text",
-                    "base_sha": base_sha,
-                    "start_sha": start_sha,
-                    "head_sha": head_sha,
-                    "new_path": new_path,
-                    "old_path": old_path,
-                    "new_line": new_line,
-                    "old_line": old_line,
-                })
-            };
+                });
 
             // Add line_range for multi-line comments
             if is_multi_line {
@@ -2047,7 +2014,7 @@ impl Review {
             }
             Ok(file) => file,
         };
-        file.write_all(&serde_json::to_string(&self).unwrap().as_bytes())
+        file.write_all(serde_json::to_string(&self).unwrap().as_bytes())
             .unwrap();
     }
 
@@ -2059,14 +2026,14 @@ impl Review {
             .iter()
             .enumerate()
             .filter(|(_idx, comment)| {
-                return comment.path == path
+                comment.path == path
                     && (comment.line == line
                         || (comment.start_line.is_some()
                             && comment.start_line.unwrap() <= line
-                            && comment.line >= line));
+                            && comment.line >= line))
             })
             .collect();
-        if eligible_comments.len() > 0 {
+        if !eligible_comments.is_empty() {
             Some(eligible_comments[0])
         } else {
             None
@@ -2103,7 +2070,7 @@ impl Review {
             match get_config_from_file() {
                 None => {
                     api::err_writeln("Could not read configuration file.");
-                    return None;
+                    None
                 }
                 Some(config) => Some(Review::new(
                     config.owner.to_string(),
@@ -2125,7 +2092,7 @@ impl Review {
 /// If the line is only in the new file (added), old_line will be None
 fn get_line_mapping(
     repo: &Repository,
-    file_path: &str,
+    _file_path: &str,
     base_sha: &str,
     head_sha: &str,
     line_number: u32,
@@ -2160,17 +2127,7 @@ fn get_line_mapping(
     let mut line_map: Vec<(Option<u32>, Option<u32>)> = Vec::new();
 
     diff.foreach(
-        &mut |delta, _progress| {
-            let delta_path = delta
-                .new_file()
-                .path()
-                .unwrap_or(delta.old_file().path().unwrap());
-            if delta_path.to_str() == Some(file_path) {
-                true
-            } else {
-                true
-            }
-        },
+        &mut |_delta, _progress| { true },
         None,
         None,
         Some(&mut |_delta, _hunk, line| {
@@ -2199,18 +2156,16 @@ fn get_line_mapping(
     for (old_line, new_line) in &line_map {
         if side == Side::LEFT {
             // Looking for old line number
-            if let Some(old) = old_line {
-                if *old == line_number {
+            if let Some(old) = old_line
+                && *old == line_number {
                     return Ok((*old_line, *new_line));
                 }
-            }
         } else {
             // Looking for new line number
-            if let Some(new) = new_line {
-                if *new == line_number {
+            if let Some(new) = new_line
+                && *new == line_number {
                     return Ok((*old_line, *new_line));
                 }
-            }
         }
     }
 
@@ -2228,7 +2183,7 @@ fn get_review_directory() -> PathBuf {
     let git_dir = Path::new(git_output.trim());
     let review_dir = git_dir.join(Path::new("reviews"));
     std::fs::create_dir_all(&review_dir).unwrap();
-    return review_dir;
+    review_dir
 }
 
 fn get_review_file_path(pr_number: u32) -> PathBuf {
@@ -2272,6 +2227,6 @@ pub fn update_configuration(config: Config) {
         }
         Ok(file) => file,
     };
-    file.write_all(&serde_json::to_string(&config).unwrap().as_bytes())
+    file.write_all(serde_json::to_string(&config).unwrap().as_bytes())
         .unwrap();
 }
