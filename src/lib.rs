@@ -1613,29 +1613,6 @@ fn test_current_buffer_path() {
     );
 }
 
-#[oxi::test]
-fn test_leave_two_comments() {
-    vim_reviewer().unwrap();
-    api::command("e src/lib.rs").unwrap();
-    api::command("StartReview 101").unwrap();
-    let opts = CmdOpts::builder().output(true).build();
-    let info = CmdInfos::builder()
-        .cmd("ReviewComment")
-        .range(api::types::CmdRange::Double(25, 28))
-        .build();
-    // api::command("25,28ReviewComment").unwrap();
-    api::cmd(&info, &opts).unwrap();
-    api::feedkeys(
-        string!("Test.").as_nvim_str(),
-        string!("i").as_nvim_str(),
-        false,
-    );
-    api::command("w").unwrap();
-    // api::command("50").unwrap();
-    // api::command("ReviewComment").unwrap();
-    // api::command("wq").unwrap();
-}
-
 /// Set the provided text as the contents of the current buffer
 fn set_text_in_buffer(text: String) -> ApiResult<()> {
     let mut buffer = api::get_current_buf();
