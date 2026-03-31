@@ -358,9 +358,7 @@ fn vim_reviewer() -> oxi::Result<()> {
                             let comments_in_buffer: Vec<&Comment> = review
                                 .comments
                                 .iter()
-                                .filter(|comment| {
-                                    comment.path == buffer_path.to_str().unwrap()
-                                })
+                                .filter(|comment| comment.path == buffer_path.to_str().unwrap())
                                 .collect();
                             for comment in comments_in_buffer {
                                 let start_line = comment.start_line.unwrap_or(comment.line);
@@ -425,15 +423,15 @@ fn vim_reviewer() -> oxi::Result<()> {
 
                     // Optionally try API fetch for enrichment
                     if let Some(config) = get_config_from_file()
-                        && let Some(pr_info) = fetch_pr_info_from_api(&config, pr_number) {
-                            // Cache the enriched info
-                            if let Ok(json) = serde_json::to_string(&pr_info)
-                                && let Ok(mut file) =
-                                    File::create(get_pr_info_cache_path(pr_number))
-                                {
-                                    let _ = file.write_all(json.as_bytes());
-                                }
+                        && let Some(pr_info) = fetch_pr_info_from_api(&config, pr_number)
+                    {
+                        // Cache the enriched info
+                        if let Ok(json) = serde_json::to_string(&pr_info)
+                            && let Ok(mut file) = File::create(get_pr_info_cache_path(pr_number))
+                        {
+                            let _ = file.write_all(json.as_bytes());
                         }
+                    }
 
                     Ok(())
                 }
@@ -748,10 +746,11 @@ fn vim_reviewer() -> oxi::Result<()> {
         |_args: CommandArgs| -> ApiResult<()> {
             // Invalidate PrInfo cache so files are re-computed from git
             if let Some(config) = get_config_from_file()
-                && let Some(pr_number) = config.active_pr {
-                    let cache_path = get_pr_info_cache_path(pr_number);
-                    let _ = std::fs::remove_file(&cache_path);
-                }
+                && let Some(pr_number) = config.active_pr
+            {
+                let cache_path = get_pr_info_cache_path(pr_number);
+                let _ = std::fs::remove_file(&cache_path);
+            }
             refresh_status_buffer()?;
             Ok(())
         }
@@ -992,11 +991,12 @@ fn get_files_changed(base_branch: &str) -> Result<Vec<FileChange>, String> {
         let mut deletions: u32 = 0;
 
         if let Ok(patch) = git2::Patch::from_diff(&diff, idx)
-            && let Some(ref patch) = patch {
-                let (_, adds, dels) = patch.line_stats().unwrap_or((0, 0, 0));
-                additions = adds as u32;
-                deletions = dels as u32;
-            }
+            && let Some(ref patch) = patch
+        {
+            let (_, adds, dels) = patch.line_stats().unwrap_or((0, 0, 0));
+            additions = adds as u32;
+            deletions = dels as u32;
+        }
 
         files.push(FileChange {
             path,
@@ -1020,14 +1020,16 @@ fn get_or_build_pr_info(config: &Config, pr_number: u32) -> Option<PrInfo> {
 
     // Try loading from cache
     if cache_path.exists()
-        && let Ok(mut file) = File::open(&cache_path) {
-            let mut contents = String::new();
-            if file.read_to_string(&mut contents).is_ok()
-                && let Ok(cached) = serde_json::from_str::<PrInfo>(&contents)
-                    && cached.base_branch == base_branch {
-                        return Some(cached);
-                    }
+        && let Ok(mut file) = File::open(&cache_path)
+    {
+        let mut contents = String::new();
+        if file.read_to_string(&mut contents).is_ok()
+            && let Ok(cached) = serde_json::from_str::<PrInfo>(&contents)
+            && cached.base_branch == base_branch
+        {
+            return Some(cached);
         }
+    }
 
     // Build locally
     let files_changed = match get_files_changed(&base_branch) {
@@ -1048,9 +1050,10 @@ fn get_or_build_pr_info(config: &Config, pr_number: u32) -> Option<PrInfo> {
 
     // Cache to disk
     if let Ok(json) = serde_json::to_string(&pr_info)
-        && let Ok(mut file) = File::create(&cache_path) {
-            let _ = file.write_all(json.as_bytes());
-        }
+        && let Ok(mut file) = File::create(&cache_path)
+    {
+        let _ = file.write_all(json.as_bytes());
+    }
 
     Some(pr_info)
 }
@@ -1269,14 +1272,15 @@ fn build_status_lines(
 
     // Review body
     if let Some(review) = review
-        && !review.body.is_empty() {
-            lines.push("Review body:".to_string());
+        && !review.body.is_empty()
+    {
+        lines.push("Review body:".to_string());
+        actions.push(StatusLineAction::None);
+        for body_line in review.body.lines() {
+            lines.push(format!("  {}", body_line));
             actions.push(StatusLineAction::None);
-            for body_line in review.body.lines() {
-                lines.push(format!("  {}", body_line));
-                actions.push(StatusLineAction::None);
-            }
         }
+    }
 
     (lines, actions)
 }
@@ -1747,9 +1751,7 @@ impl Review {
         }
 
         // Use the backend_url from config, or default to gitlab.com
-        let base_url = self
-            .backend_url.as_deref()
-            .unwrap_or("https://gitlab.com");
+        let base_url = self.backend_url.as_deref().unwrap_or("https://gitlab.com");
 
         let encoded_project = format!("{}/{}", self.owner, self.repo).replace("/", "%2F");
         let mut last_response: Option<reqwest::blocking::Response> = None;
@@ -1843,15 +1845,15 @@ impl Review {
             // Build position object
             // For multi-line comments, use line_range instead of new_line/old_line
             let mut position = serde_json::json!({
-                    "position_type": "text",
-                    "base_sha": base_sha,
-                    "start_sha": start_sha,
-                    "head_sha": head_sha,
-                    "new_path": new_path,
-                    "old_path": old_path,
-                    "new_line": new_line,
-                    "old_line": old_line,
-                });
+                "position_type": "text",
+                "base_sha": base_sha,
+                "start_sha": start_sha,
+                "head_sha": head_sha,
+                "new_path": new_path,
+                "old_path": old_path,
+                "new_line": new_line,
+                "old_line": old_line,
+            });
 
             // Add line_range for multi-line comments
             if is_multi_line {
@@ -2127,7 +2129,7 @@ fn get_line_mapping(
     let mut line_map: Vec<(Option<u32>, Option<u32>)> = Vec::new();
 
     diff.foreach(
-        &mut |_delta, _progress| { true },
+        &mut |_delta, _progress| true,
         None,
         None,
         Some(&mut |_delta, _hunk, line| {
@@ -2157,15 +2159,17 @@ fn get_line_mapping(
         if side == Side::LEFT {
             // Looking for old line number
             if let Some(old) = old_line
-                && *old == line_number {
-                    return Ok((*old_line, *new_line));
-                }
+                && *old == line_number
+            {
+                return Ok((*old_line, *new_line));
+            }
         } else {
             // Looking for new line number
             if let Some(new) = new_line
-                && *new == line_number {
-                    return Ok((*old_line, *new_line));
-                }
+                && *new == line_number
+            {
+                return Ok((*old_line, *new_line));
+            }
         }
     }
 
