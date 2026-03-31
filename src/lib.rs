@@ -862,10 +862,7 @@ fn new_temporary_buffer(on_save_command: Option<&str>) -> ApiResult<()> {
     api::command(&format!("sp {}", file.path().display()))?;
     api::command("set ft=markdown")?;
     if let Some(cmd) = on_save_command {
-        api::command(&format!(
-            "autocmd BufWritePre <buffer> :{}",
-            cmd
-        ))?;
+        api::command(&format!("autocmd BufWritePre <buffer> :{}", cmd))?;
     }
     Ok(())
 }
