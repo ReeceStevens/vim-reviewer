@@ -288,33 +288,18 @@ fn update_config_from_remote() -> oxi::Result<()> {
     };
     let repo = match Repository::open(&current_dir) {
         Ok(repo) => repo,
-        Err(e) => {
-            api::err_writeln(&format!("Current directory is not a git repository: {}", e));
-            return Ok(());
-        }
+        Err(_) => return Ok(()),
     };
     let remote_url = match repo.find_remote("origin") {
         Ok(remote) => match remote.url() {
             Some(url) => url.to_string(),
-            None => {
-                api::err_writeln("Remote 'origin' has no URL");
-                return Ok(());
-            }
+            None => return Ok(()),
         },
-        Err(e) => {
-            api::err_writeln(&format!("Failed to find remote 'origin': {}", e));
-            return Ok(());
-        }
+        Err(_) => return Ok(()),
     };
     let (owner, repo_name, backend) = match parse_config_from_url(&remote_url) {
         Ok(results) => results,
-        Err(e) => {
-            api::err_writeln(&format!(
-                "Failed to parse repository information from remote URL: {}",
-                e
-            ));
-            return Ok(());
-        }
+        Err(_) => return Ok(()),
     };
 
     update_configuration(Config {
