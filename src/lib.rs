@@ -14,7 +14,7 @@ use nvim_oxi::api::types::{CmdInfos, CommandArgs, CommandNArgs, CommandRange};
 use nvim_oxi::string;
 use nvim_oxi::{self as oxi, Array, Dictionary, Object};
 use regex::Regex;
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
+use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use tempfile::NamedTempFile;
@@ -374,11 +374,9 @@ fn vim_reviewer() -> oxi::Result<()> {
                                 for line in start_line..=end_line {
                                     sign_idx += 1;
                                     let command = format!(
-                                    "sign place {} line={} name=PrReviewComment group=PrReviewSigns buffer={}",
-                                    sign_idx,
-                                    line,
-                                    handle,
-                                );
+                                        "sign place {} line={} name=PrReviewComment group=PrReviewSigns buffer={}",
+                                        sign_idx, line, handle,
+                                    );
                                     api::command(&command)?;
                                 }
                             }
@@ -786,18 +784,18 @@ fn vim_reviewer() -> oxi::Result<()> {
                     // Move to window below, open file, run diff
                     api::command("wincmd j")?;
                     api::command(&format!("edit {}", path))?;
-                    let diff_cmd =
-                        format!("Gvdiffsplit origin/{}", base_branch);
+                    let diff_cmd = format!("Gvdiffsplit origin/{}", base_branch);
                     if let Err(_) = api::command(&diff_cmd) {
                         // Fallback: just open the file without diff
-                        api::err_writeln("Could not open fugitive diff. Is vim-fugitive installed?");
+                        api::err_writeln(
+                            "Could not open fugitive diff. Is vim-fugitive installed?",
+                        );
                     }
                 }
                 Some(StatusLineAction::JumpToComment(path, line)) => {
                     api::command("wincmd j")?;
                     api::command(&format!("edit {}", path))?;
-                    let diff_cmd =
-                        format!("Gvdiffsplit origin/{}", base_branch);
+                    let diff_cmd = format!("Gvdiffsplit origin/{}", base_branch);
                     let _ = api::command(&diff_cmd);
                     api::command(&format!("{}", line))?;
                 }
@@ -1025,11 +1023,7 @@ fn get_pr_info_cache_path(pr_number: u32) -> PathBuf {
 /// Get or build PrInfo, using disk cache when available.
 fn get_or_build_pr_info(config: &Config, pr_number: u32) -> Option<PrInfo> {
     let cache_path = get_pr_info_cache_path(pr_number);
-    let base_branch = config
-        .base_branch
-        .as_deref()
-        .unwrap_or("main")
-        .to_string();
+    let base_branch = config.base_branch.as_deref().unwrap_or("main").to_string();
 
     // Try loading from cache
     if cache_path.exists() {
@@ -1075,11 +1069,7 @@ fn get_or_build_pr_info(config: &Config, pr_number: u32) -> Option<PrInfo> {
 /// Optionally fetch PR/MR info from the API for enrichment (title, head_branch).
 /// Returns None on any failure — this is never required.
 fn fetch_pr_info_from_api(config: &Config, pr_number: u32) -> Option<PrInfo> {
-    let base_branch = config
-        .base_branch
-        .as_deref()
-        .unwrap_or("main")
-        .to_string();
+    let base_branch = config.base_branch.as_deref().unwrap_or("main").to_string();
 
     let (token_var, _) = match config.backend {
         GitBackend::GitHub => ("GH_REVIEW_API_TOKEN", "GitHub"),
@@ -1136,8 +1126,7 @@ fn fetch_pr_info_from_api(config: &Config, pr_number: u32) -> Option<PrInfo> {
                 .backend_url
                 .as_deref()
                 .unwrap_or("https://gitlab.com");
-            let encoded_project =
-                format!("{}/{}", config.owner, config.repo).replace("/", "%2F");
+            let encoded_project = format!("{}/{}", config.owner, config.repo).replace("/", "%2F");
             let url = format!(
                 "{}/api/v4/projects/{}/merge_requests/{}",
                 base_url, encoded_project, pr_number
@@ -1225,10 +1214,7 @@ fn build_status_lines(
     actions.push(StatusLineAction::None);
 
     // Files changed section
-    lines.push(format!(
-        "Files changed ({}):",
-        pr_info.files_changed.len()
-    ));
+    lines.push(format!("Files changed ({}):", pr_info.files_changed.len()));
     actions.push(StatusLineAction::None);
 
     let separator = "\u{2500}".repeat(50);
@@ -1285,10 +1271,7 @@ fn build_status_lines(
                     .collect::<String>()
                     .replace('\n', " ");
                 let suffix = if comment.body.len() > 50 { "..." } else { "" };
-                lines.push(format!(
-                    "    [+] {} : {}{}",
-                    line_display, preview, suffix
-                ));
+                lines.push(format!("    [+] {} : {}{}", line_display, preview, suffix));
                 actions.push(StatusLineAction::ToggleComment(comment_global_idx));
             }
             comment_global_idx += 1;
@@ -1325,10 +1308,7 @@ fn install_status_keymaps() -> ApiResult<()> {
         ("n", "R", ":ReviewStatusRefresh<CR>"),
     ];
     for (_mode, lhs, rhs) in &keymaps {
-        api::command(&format!(
-            "nnoremap <buffer> <silent> {} {}",
-            lhs, rhs
-        ))?;
+        api::command(&format!("nnoremap <buffer> <silent> {} {}", lhs, rhs))?;
     }
     Ok(())
 }
@@ -1409,7 +1389,9 @@ fn open_status_buffer(pr_number: u32) -> ApiResult<()> {
     api::command(&format!("topleft sbuffer {}", handle))?;
 
     // Set buffer options
-    api::command("setlocal buftype=nofile bufhidden=wipe noswapfile nomodifiable nonumber norelativenumber signcolumn=no")?;
+    api::command(
+        "setlocal buftype=nofile bufhidden=wipe noswapfile nomodifiable nonumber norelativenumber signcolumn=no",
+    )?;
 
     // Set buffer name (escape # to prevent neovim command-line expansion)
     api::command(&format!("file [Review\\ \\#{}]", pr_number))?;
@@ -1549,15 +1531,15 @@ fn test_build_status_lines_with_comments() {
 
     // Should have a collapsed comment line
     assert!(lines.iter().any(|l| l.contains("[+] L42")));
-    assert!(lines
-        .iter()
-        .any(|l| l.contains("Please rename this variable")));
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("Please rename this variable"))
+    );
 
     // Should have review body
     assert!(lines.iter().any(|l| l.contains("Review body:")));
-    assert!(lines
-        .iter()
-        .any(|l| l.contains("Looks good overall")));
+    assert!(lines.iter().any(|l| l.contains("Looks good overall")));
 
     assert_eq!(lines.len(), actions.len());
 }
