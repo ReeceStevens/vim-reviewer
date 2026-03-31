@@ -1,4 +1,17 @@
-#! /usr/bin/env bash
+#!/usr/bin/env bash
+set -e
 
-cargo build
-cp ./target/debug/libvim_reviewer.dylib ./lua/vim_reviewer.so
+profile="${1:-debug}"
+
+case "$profile" in
+    debug)   cargo build ;;
+    release) cargo build --release ;;
+    *) echo "Usage: ./build [debug|release]"; exit 1 ;;
+esac
+
+case "$(uname -s)" in
+    Linux*)               cp "./target/$profile/libvim_reviewer.so"    ./lua/vim_reviewer.so  ;;
+    Darwin*)              cp "./target/$profile/libvim_reviewer.dylib" ./lua/vim_reviewer.so  ;;
+    MINGW*|MSYS*|CYGWIN*) cp "./target/$profile/vim_reviewer.dll"     ./lua/vim_reviewer.dll ;;
+    *) echo "Unsupported platform: $(uname -s)"; exit 1 ;;
+esac
