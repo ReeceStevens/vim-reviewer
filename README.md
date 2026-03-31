@@ -20,42 +20,22 @@ This plugin requires:
 
 1. `neovim`
 2. `vim-fugitive`
-
-Within the plugin is a Python module that depends on the `requests` python
-package.
+3. A working Rust toolchain (`cargo`)
 
 ## Installation
 
-_Note: this install process is not ideal due to all the little details of
-getting the python environment working. This will be an area of future work for
-this plugin._
-
-With `vim-plug`:
+With `lazy.nvim`, it's pretty easy:
 
 ```vim
-Plug 'ReeceStevens/vim-reviewer'
+{ "ReeceStevens/vim-reviewer" }
 ```
 
-A Python3 virtualenv must be created for this plugin to be installed. I
-recommend the following approach:
+If you aren't using `lazy.nvim`, you can just clone the repository and run
+`./build release` to build the release version of the plugin. Then, make sure
+to add the plugin repository location to your `runtimepath` in your `init.vim`:
 
-1. Create a dedicated Python 3.7 or up virtualenv in `~/.vim`
-
-2. Source that virtualenv and install `pynvim`
-
-3. Set that virtual env as your host python for neovim: 
-
-```
-let g:python3_host_prog = $HOME . '/.vim/python-virtual-env/nvim-venv/bin/python'
-```
-
-4. Pull down the repository with `:PlugInstall`
-
-5. Install the python module included with the plugin (with virtualenv
-   activated):
-
-```
-pip install -e ~/.vim/plugs/vim-reviewer/offline_pr_review
+```vim
+set runtimepath+=/path/to/vim-reviewer
 ```
 
 ## Usage
@@ -72,6 +52,12 @@ respectively.
 
 Similarly, you can use the `:ReviewBody` command to fill out the body of a PR
 review.
+
+You can review the diffstat of the PR by running `:ReviewStatus`. This will
+show you all the files changed in the PR and show the comments you've made on
+each file. It also will show you the current review body comment. Hitting
+`<Enter>` on a file will take you to that file and open a vertical split diff
+between the base branch and the PR branch.
 
 Once you're done leaving comments, you can type `:PublishReview` to push the
 draft review up to GitHub or GitLab.
@@ -168,17 +154,3 @@ comments to the right spot.
 The first pain point this plugin is meant to solve is this last copy step-- now,
 I can leave comments directly in vim, then publish them all to GitHub or GitLab as a draft
 review.
-
-## FAQ
-
-### Why neovim and not vim?
-
-Mostly, due to ease of development. This plugin takes advantage of neovim's RPC
-system and is primarily written in Python.
-
-# Testing
-
-In a neovim installation with `vim-fugitive` installed, source the `.nvimrc`
-local to this repository. Run `:UpdateRemotePlugins`, then re-open vim. Ensure
-that there is a local virtualenv `./cli-review-venv`, which has an editable
-install of `offline_pr_review` and `requests`.
