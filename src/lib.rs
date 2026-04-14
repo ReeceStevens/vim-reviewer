@@ -829,6 +829,35 @@ fn vim_reviewer() -> oxi::Result<()> {
         }
     );
 
+    create_command!(
+        "ReviewStatusViewed",
+        "Toggle viewed status of file under cursor in status window",
+        CommandNArgs::ZeroOrOne,
+        |_args: CommandArgs| -> ApiResult<()> {
+            let cursor = api::get_current_win().get_cursor()?;
+            let line_idx = (cursor.0 as usize).saturating_sub(1);
+
+            let action = STATUS_LINE_ACTIONS.with(|a| {
+                let actions = a.borrow();
+                actions.get(line_idx).cloned()
+            });
+
+            if let Some(StatusLineAction::OpenFile(path)) = action {
+                let config = get_config_from_file();
+                if let Some(pr_number) = config.and_then(|c| c.active_pr) {
+                    if let Some(mut review) = Review::get_review(pr_number) {
+                        review.toggle_viewed(&path);
+                        review.save();
+                    }
+                }
+                let saved_cursor = api::get_current_win().get_cursor()?;
+                refresh_status_buffer()?;
+                let _ = api::get_current_win().set_cursor(saved_cursor.0, saved_cursor.1);
+            }
+            Ok(())
+        }
+    );
+
     Ok(())
 }
 
@@ -1182,7 +1211,20 @@ fn build_status_lines(
     actions.push(StatusLineAction::None);
 
     // Files changed section
-    lines.push(format!("Files changed ({}):", pr_info.files_changed.len()));
+    let viewed_count = review
+        .map(|r| {
+            pr_info
+                .files_changed
+                .iter()
+                .filter(|fc| r.viewed_files.contains(&fc.path))
+                .count()
+        })
+        .unwrap_or(0);
+    lines.push(format!(
+        "Files changed ({}/{}):",
+        viewed_count,
+        pr_info.files_changed.len()
+    ));
     actions.push(StatusLineAction::None);
 
     let separator = "\u{2500}".repeat(50);
@@ -1196,9 +1238,12 @@ fn build_status_lines(
     let mut comment_global_idx: usize = 0;
 
     for fc in &pr_info.files_changed {
+        let viewed = review.map_or(false, |r| r.viewed_files.contains(&fc.path));
+        let checkbox = if viewed { "[x]" } else { "[ ]" };
         let stat_display = format!("+{} -{}", fc.additions, fc.deletions);
         lines.push(format!(
-            "  {} {:<40} | {}",
+            "  {} {} {:<40} | {}",
+            checkbox,
             format_file_status_char(&fc.status),
             fc.path,
             stat_display
@@ -1274,6 +1319,7 @@ fn install_status_keymaps() -> ApiResult<()> {
         ("n", "<Tab>", ":ReviewStatusTab<CR>"),
         ("n", "q", ":bwipeout<CR>"),
         ("n", "R", ":ReviewStatusRefresh<CR>"),
+        ("n", "C", ":ReviewStatusViewed<CR>"),
     ];
     for (_mode, lhs, rhs) in &keymaps {
         api::command(&format!("nnoremap <buffer> <silent> {} {}", lhs, rhs))?;
@@ -1289,14 +1335,17 @@ fn install_status_syntax() -> ApiResult<()> {
         // Key-value headers: Base: main, Head: fix-widget, Status: ...
         r#"syn match reviewStatusHeader /^\(Base\|Head\|Status\):/ nextgroup=reviewStatusBranch skipwhite"#,
         r#"syn match reviewStatusBranch /.*/ contained"#,
-        // Section headings: Files changed (3):, Review body:
-        r#"syn match reviewStatusHeading /^Files changed\ze\s\+(\d\+):/ nextgroup=reviewStatusCount skipwhite"#,
+        // Section headings: Files changed (1/3):, Review body:
+        r#"syn match reviewStatusHeading /^Files changed\ze\s\+(\d\+\/\d\+):/ nextgroup=reviewStatusCount skipwhite"#,
         r#"syn match reviewStatusHeading /^Review body:/"#,
-        r#"syn match reviewStatusCount /(\d\+)/hs=s+1,he=e-1 contained"#,
+        r#"syn match reviewStatusCount /(\d\+\/\d\+)/hs=s+1,he=e-1 contained"#,
         // Separator: ─────────
         r#"syn match reviewStatusSeparator /^─\+$/"#,
-        // File entry: "  M src/lib.rs                | +45 -12"
-        r#"syn match reviewStatusFile /^\s\+[MADRC?]\s.\+|/ contains=reviewStatusModifier,reviewStatusPath,reviewStatusPipe"#,
+        // File entry: "  [x] M src/lib.rs                | +45 -12"
+        r#"syn match reviewStatusFile /^\s\+\[.\]\s[MADRC?]\s.\+|/ contains=reviewStatusViewed,reviewStatusUnviewed,reviewStatusModifier,reviewStatusPath,reviewStatusPipe"#,
+        // Viewed/unviewed checkbox
+        r#"syn match reviewStatusViewed /\[x\]/ contained"#,
+        r#"syn match reviewStatusUnviewed /\[ \]/ contained"#,
         r#"syn match reviewStatusModifier /[MADRC?]/ contained"#,
         r#"syn match reviewStatusPath /[MADRC?]\@<=\s\+\S\+/ contained"#,
         r#"syn match reviewStatusPipe /|/ contained"#,
@@ -1320,6 +1369,8 @@ fn install_status_syntax() -> ApiResult<()> {
         "hi def link reviewStatusPipe Comment",
         "hi def link reviewStatusAdd diffAdded",
         "hi def link reviewStatusDelete diffRemoved",
+        "hi def link reviewStatusViewed diffAdded",
+        "hi def link reviewStatusUnviewed Comment",
         "hi def link reviewStatusToggle Special",
         "hi def link reviewStatusLineRef Number",
         "hi def link reviewStatusCommentBody Comment",
@@ -1453,7 +1504,7 @@ fn test_build_status_lines_basic() {
     assert!(lines.iter().any(|l| l.contains("Head: fix-widget")));
 
     // Files
-    assert!(lines.iter().any(|l| l.contains("Files changed (2):")));
+    assert!(lines.iter().any(|l| l.contains("Files changed (0/2):")));
     assert!(lines.iter().any(|l| l.contains("M src/lib.rs")));
     assert!(lines.iter().any(|l| l.contains("A src/new.rs")));
     assert!(lines.iter().any(|l| l.contains("+10 -3")));
@@ -1493,6 +1544,7 @@ fn test_build_status_lines_with_comments() {
             None,
         )],
         in_progress_comment: None,
+        viewed_files: HashSet::new(),
     };
 
     let (lines, actions) = build_status_lines(7, &pr_info, Some(&review));
@@ -1510,6 +1562,90 @@ fn test_build_status_lines_with_comments() {
     assert!(lines.iter().any(|l| l.contains("Looks good overall")));
 
     assert_eq!(lines.len(), actions.len());
+}
+
+#[test]
+fn test_build_status_lines_viewed_files() {
+    let pr_info = PrInfo {
+        pr_number: 42,
+        title: Some("Fix the widget".to_string()),
+        base_branch: "main".to_string(),
+        head_branch: Some("fix-widget".to_string()),
+        files_changed: vec![
+            FileChange {
+                path: "src/lib.rs".to_string(),
+                additions: 10,
+                deletions: 3,
+                status: "M".to_string(),
+            },
+            FileChange {
+                path: "src/new.rs".to_string(),
+                additions: 50,
+                deletions: 0,
+                status: "A".to_string(),
+            },
+        ],
+    };
+
+    let mut viewed = HashSet::new();
+    viewed.insert("src/lib.rs".to_string());
+
+    let review = Review {
+        owner: "test".to_string(),
+        repo: "repo".to_string(),
+        backend: GitBackend::GitHub,
+        backend_url: None,
+        pr_number: 42,
+        body: String::new(),
+        comments: vec![],
+        in_progress_comment: None,
+        viewed_files: viewed,
+    };
+
+    let (lines, actions) = build_status_lines(42, &pr_info, Some(&review));
+
+    // Header shows viewed count
+    assert!(lines.iter().any(|l| l.contains("Files changed (1/2):")));
+
+    // Viewed file has [x], unviewed has [ ]
+    assert!(lines.iter().any(|l| l.contains("[x] M src/lib.rs")));
+    assert!(lines.iter().any(|l| l.contains("[ ] A src/new.rs")));
+
+    assert_eq!(lines.len(), actions.len());
+}
+
+#[test]
+fn test_review_deserialization_backwards_compat() {
+    let json = r#"{
+        "owner": "test",
+        "repo": "repo",
+        "backend": "GitHub",
+        "pr_number": 1,
+        "body": "",
+        "comments": [],
+        "in_progress_comment": null
+    }"#;
+    let review: Review = serde_json::from_str(json).unwrap();
+    assert!(review.viewed_files.is_empty());
+}
+
+#[test]
+fn test_toggle_viewed() {
+    let mut review = Review::new(
+        "owner".to_string(),
+        "repo".to_string(),
+        GitBackend::GitHub,
+        None,
+        1,
+        String::new(),
+        vec![],
+    );
+
+    assert!(!review.is_viewed("src/lib.rs"));
+    review.toggle_viewed("src/lib.rs");
+    assert!(review.is_viewed("src/lib.rs"));
+    review.toggle_viewed("src/lib.rs");
+    assert!(!review.is_viewed("src/lib.rs"));
 }
 
 #[test]
@@ -1646,6 +1782,8 @@ pub struct Review {
     body: String,
     comments: Vec<Comment>,
     in_progress_comment: Option<Comment>,
+    #[serde(default)]
+    viewed_files: HashSet<String>,
 }
 
 impl Review {
@@ -1667,6 +1805,7 @@ impl Review {
             body,
             comments,
             in_progress_comment: None,
+            viewed_files: HashSet::new(),
         }
     }
 
@@ -1983,6 +2122,18 @@ impl Review {
 
     pub fn set_body(&mut self, body: String) {
         self.body = body;
+    }
+
+    pub fn toggle_viewed(&mut self, path: &str) {
+        if self.viewed_files.contains(path) {
+            self.viewed_files.remove(path);
+        } else {
+            self.viewed_files.insert(path.to_string());
+        }
+    }
+
+    pub fn is_viewed(&self, path: &str) -> bool {
+        self.viewed_files.contains(path)
     }
 
     pub fn save(&self) {
