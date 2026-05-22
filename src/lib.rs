@@ -635,6 +635,35 @@ fn vim_reviewer() -> oxi::Result<()> {
     );
 
     create_command!(
+        "ShowComment",
+        "Display the comment under the cursor in a floating hover window.",
+        CommandNArgs::ZeroOrOne,
+        |args: CommandArgs| -> ApiResult<()> {
+            let (_side, path) = get_current_buffer_path()?;
+            let review = get_current_review();
+            match review {
+                None => {
+                    api::err_writeln("No review is currently active.");
+                    Ok(())
+                }
+                Some(review) => {
+                    let comment_to_show = review.get_comment_at_position(
+                        path.to_str().unwrap().to_string(),
+                        args.line1 as u32,
+                    );
+                    match comment_to_show {
+                        None => {
+                            api::out_write("No comment on selected line\n");
+                            Ok(())
+                        }
+                        Some((_idx, comment)) => show_comment_hover(&comment.body),
+                    }
+                }
+            }
+        }
+    );
+
+    create_command!(
         "DeleteComment",
         "Delete the comment under the cursor, if one exists.",
         CommandNArgs::ZeroOrOne,
@@ -1703,6 +1732,67 @@ fn test_current_buffer_path() {
 fn set_text_in_buffer(text: String) -> ApiResult<()> {
     let mut buffer = api::get_current_buf();
     buffer.set_lines(0..10000000, false, text.split("\n"))?;
+    Ok(())
+}
+
+/// Render `body` in a floating, read-only, LSP-style hover window anchored to the
+/// cursor. The window dismisses itself on the next cursor move, leave, or insert-enter.
+///
+/// Routes the floating-window and option calls through VimL dispatch
+/// (`nvim_call_function`) rather than nvim-oxi's typed `open_win` / `set_option_value`.
+/// The `WindowOpts` FFI struct in nvim-oxi 0.6.0 (built with the `neovim-0-11`
+/// feature) does not match nvim 0.12's ABI and aborts the process; routing through
+/// VimL goes through nvim's own version-correct conversion layer.
+fn show_comment_hover(body: &str) -> ApiResult<()> {
+    let lines: Vec<&str> = body.split('\n').collect();
+    let height = lines.len().clamp(1, 20) as i64;
+    let width = lines
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(1)
+        .clamp(20, 80) as i64;
+
+    let mut buf = api::create_buf(false, true)
+        .map_err(|_| api::Error::Other("Failed to create hover buffer".to_string()))?;
+    buf.set_lines(.., false, lines.iter().copied())?;
+    let buf_handle: i64 = {
+        let obj: oxi::Object = (&buf).into();
+        unsafe { obj.as_integer_unchecked() }
+    };
+
+    let buf_scope = Dictionary::from_iter([("buf", Object::from(buf_handle))]);
+    let _: Object = api::call_function(
+        "nvim_set_option_value",
+        ("modifiable", false, buf_scope.clone()),
+    )?;
+    let _: Object = api::call_function(
+        "nvim_set_option_value",
+        ("filetype", "markdown", buf_scope),
+    )?;
+
+    let win_config = Dictionary::from_iter([
+        ("relative", Object::from("cursor")),
+        ("row", Object::from(1i64)),
+        ("col", Object::from(0i64)),
+        ("width", Object::from(width)),
+        ("height", Object::from(height)),
+        ("style", Object::from("minimal")),
+        ("border", Object::from("rounded")),
+        ("focusable", Object::from(false)),
+    ]);
+    let win_handle: i64 =
+        api::call_function("nvim_open_win", (buf_handle, false, win_config))?;
+
+    let win_scope = Dictionary::from_iter([("win", Object::from(win_handle))]);
+    let _: Object =
+        api::call_function("nvim_set_option_value", ("wrap", true, win_scope))?;
+
+    api::command(&format!(
+        "autocmd CursorMoved,CursorMovedI,BufLeave,InsertEnter <buffer> ++once lua pcall(vim.api.nvim_win_close, {}, true)",
+        win_handle
+    ))?;
+
     Ok(())
 }
 
