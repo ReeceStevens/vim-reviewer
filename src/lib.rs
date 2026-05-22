@@ -1419,8 +1419,12 @@ fn open_status_buffer(pr_number: u32) -> ApiResult<()> {
         let obj: oxi::Object = buf.into();
         let handle = unsafe { obj.as_integer_unchecked() };
         if api::call_function::<_, i32>("bufexists", (handle,))? != 0 {
-            // Focus the existing buffer
-            api::command(&format!("sbuffer {}", handle))?;
+            let winid: i32 = api::call_function("bufwinid", (handle,))?;
+            if winid != -1 {
+                api::call_function::<_, i32>("win_gotoid", (winid,))?;
+            } else {
+                api::command(&format!("topleft sbuffer {}", handle))?;
+            }
             refresh_status_buffer()?;
             return Ok(());
         }
