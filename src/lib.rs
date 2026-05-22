@@ -569,10 +569,7 @@ fn vim_reviewer() -> oxi::Result<()> {
             config.active_pr = None;
             update_configuration(config);
             clear_review_signs()?;
-            api::out_write(string!(
-                "Archived review #{} to old-reviews/.\n",
-                pr_number
-            ));
+            api::out_write(string!("Archived review #{} to old-reviews/.\n", pr_number));
             Ok(())
         }
     );
@@ -644,22 +641,21 @@ fn vim_reviewer() -> oxi::Result<()> {
                 api::Error::Other(format!("Failed to create prompt tempfile: {}", e))
             })?;
             let prompt_path = prompt_file.path().to_path_buf();
-            std::fs::write(&prompt_path, prompt.as_bytes()).map_err(|e| {
-                api::Error::Other(format!("Failed to write prompt: {}", e))
-            })?;
+            std::fs::write(&prompt_path, prompt.as_bytes())
+                .map_err(|e| api::Error::Other(format!("Failed to write prompt: {}", e)))?;
             // Keep the file alive past the closure by leaking the handle;
             // the Lua side reads it and we clean up after :_LoadAIReview.
-            let _ = prompt_file.keep().map_err(|e| {
-                api::Error::Other(format!("Failed to persist prompt: {}", e))
-            })?;
+            let _ = prompt_file
+                .keep()
+                .map_err(|e| api::Error::Other(format!("Failed to persist prompt: {}", e)))?;
 
             let result_file = NamedTempFile::new().map_err(|e| {
                 api::Error::Other(format!("Failed to create result tempfile: {}", e))
             })?;
             let result_path = result_file.path().to_path_buf();
-            let _ = result_file.keep().map_err(|e| {
-                api::Error::Other(format!("Failed to persist result file: {}", e))
-            })?;
+            let _ = result_file
+                .keep()
+                .map_err(|e| api::Error::Other(format!("Failed to persist result file: {}", e)))?;
 
             // Hand off to Lua for the async claude call + fidget UI.
             // Do NOT bdelete here — this command runs inside BufWritePre, and
@@ -1565,7 +1561,11 @@ fn fetch_review_github(config: &Config, pr_number: u32, token: &str) -> Option<R
         "https://api.github.com/repos/{}/{}/pulls/{}/reviews",
         config.owner, config.repo, pr_number
     );
-    let resp = client.get(&reviews_url).headers(headers.clone()).send().ok()?;
+    let resp = client
+        .get(&reviews_url)
+        .headers(headers.clone())
+        .send()
+        .ok()?;
     if !resp.status().is_success() {
         api::err_writeln(&format!(
             "GitHub returned {} listing reviews for PR {}.",
@@ -1595,7 +1595,11 @@ fn fetch_review_github(config: &Config, pr_number: u32, token: &str) -> Option<R
         "https://api.github.com/repos/{}/{}/pulls/{}/reviews/{}/comments",
         config.owner, config.repo, pr_number, review_id
     );
-    let resp = client.get(&comments_url).headers(headers.clone()).send().ok()?;
+    let resp = client
+        .get(&comments_url)
+        .headers(headers.clone())
+        .send()
+        .ok()?;
     if !resp.status().is_success() {
         api::err_writeln(&format!(
             "GitHub returned {} listing review #{} comments.",
@@ -1726,7 +1730,10 @@ fn fetch_review_gitlab(config: &Config, pr_number: u32, token: &str) -> Option<R
         .map(|arr| {
             arr.iter()
                 .filter_map(|d| {
-                    let note = d["notes"].as_array()?.iter().find(|n| !n["position"].is_null())?;
+                    let note = d["notes"]
+                        .as_array()?
+                        .iter()
+                        .find(|n| !n["position"].is_null())?;
                     let pos = &note["position"];
                     let new_line = pos["new_line"].as_u64().map(|n| n as u32);
                     let old_line = pos["old_line"].as_u64().map(|n| n as u32);
@@ -1791,6 +1798,38 @@ fn format_file_status_char(status: &str) -> &str {
         "C" => "C",
         _ => "?",
     }
+}
+
+/// Word-wrap `text` into lines of at most `width` characters. Splits on spaces;
+/// extremely long words (URLs, etc.) may exceed `width` rather than be broken
+/// mid-token. Empty input yields a single empty line so blank paragraph
+/// separators in comment bodies are preserved.
+fn wrap_at_width(text: &str, width: usize) -> Vec<String> {
+    if width == 0 || text.is_empty() {
+        return vec![text.to_string()];
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_len: usize = 0;
+    for word in text.split(' ') {
+        let wlen = word.chars().count();
+        if current.is_empty() {
+            current.push_str(word);
+            current_len = wlen;
+        } else if current_len + 1 + wlen <= width {
+            current.push(' ');
+            current.push_str(word);
+            current_len += 1 + wlen;
+        } else {
+            out.push(std::mem::take(&mut current));
+            current.push_str(word);
+            current_len = wlen;
+        }
+    }
+    if !current.is_empty() || out.is_empty() {
+        out.push(current);
+    }
+    out
 }
 
 /// Build the status buffer lines and their associated actions.
@@ -1906,14 +1945,21 @@ fn build_status_lines(
                     side: comment.side,
                     orphaned,
                 });
+                // Hard-wrap body lines at 120 cols total. Indent is 9 spaces,
+                // so content wraps at 111 chars; each wrapped sub-line gets
+                // its own action entry so Enter still works from any of them.
+                const STATUS_BODY_INDENT: &str = "         ";
+                let content_width = 120usize.saturating_sub(STATUS_BODY_INDENT.chars().count());
                 for body_line in comment.body.lines() {
-                    lines.push(format!("         {}", body_line));
-                    actions.push(StatusLineAction::JumpToComment {
-                        path: fc.path.clone(),
-                        line: jump_line,
-                        side: comment.side,
-                        orphaned,
-                    });
+                    for wrapped in wrap_at_width(body_line, content_width) {
+                        lines.push(format!("{}{}", STATUS_BODY_INDENT, wrapped));
+                        actions.push(StatusLineAction::JumpToComment {
+                            path: fc.path.clone(),
+                            line: jump_line,
+                            side: comment.side,
+                            orphaned,
+                        });
+                    }
                 }
             } else {
                 // Collapsed: first 50 chars
@@ -1949,9 +1995,13 @@ fn build_status_lines(
     {
         lines.push("Review body:".to_string());
         actions.push(StatusLineAction::None);
+        const REVIEW_BODY_INDENT: &str = "  ";
+        let content_width = 120usize.saturating_sub(REVIEW_BODY_INDENT.chars().count());
         for body_line in review.body.lines() {
-            lines.push(format!("  {}", body_line));
-            actions.push(StatusLineAction::None);
+            for wrapped in wrap_at_width(body_line, content_width) {
+                lines.push(format!("{}{}", REVIEW_BODY_INDENT, wrapped));
+                actions.push(StatusLineAction::None);
+            }
         }
     }
 
@@ -2418,7 +2468,11 @@ fn show_comment_hover(body: &str) -> ApiResult<()> {
         .iter()
         .map(|l| {
             let cols = l.chars().count() as i64;
-            if cols == 0 { 1 } else { (cols + width - 1) / width }
+            if cols == 0 {
+                1
+            } else {
+                (cols + width - 1) / width
+            }
         })
         .sum();
     let height = wrapped.clamp(1, 40);
@@ -2454,7 +2508,10 @@ fn show_comment_hover(body: &str) -> ApiResult<()> {
     let win_handle: i64 = api::call_function("nvim_open_win", (buf_handle, false, win_config))?;
 
     let win_scope = Dictionary::from_iter([("win", Object::from(win_handle))]);
-    let _: Object = api::call_function("nvim_set_option_value", ("wrap", true, win_scope))?;
+    let _: Object = api::call_function("nvim_set_option_value", ("wrap", true, win_scope.clone()))?;
+    // `linebreak` makes the soft-wrap break at `breakat` characters (whitespace
+    // by default) rather than mid-word.
+    let _: Object = api::call_function("nvim_set_option_value", ("linebreak", true, win_scope))?;
 
     // `q` inside the hover closes it (useful after scrolling).
     api::command(&format!(
@@ -2607,9 +2664,7 @@ fn fetch_github_pr_patches(
     };
     if let Some(arr) = files.as_array() {
         for f in arr {
-            if let (Some(filename), Some(patch)) =
-                (f["filename"].as_str(), f["patch"].as_str())
-            {
+            if let (Some(filename), Some(patch)) = (f["filename"].as_str(), f["patch"].as_str()) {
                 out.insert(filename.to_string(), patch.to_string());
             }
         }
@@ -3550,9 +3605,8 @@ fn archive_review_file(pr_number: u32) -> ApiResult<()> {
         return Ok(());
     }
     let archive_dir = get_review_directory().join("old-reviews");
-    std::fs::create_dir_all(&archive_dir).map_err(|e| {
-        api::Error::Other(format!("Failed to create old-reviews dir: {}", e))
-    })?;
+    std::fs::create_dir_all(&archive_dir)
+        .map_err(|e| api::Error::Other(format!("Failed to create old-reviews dir: {}", e)))?;
 
     // Prefer a human-readable timestamp via `date`; fall back to epoch seconds
     // if that fails (e.g. on platforms without `date`).
@@ -3562,7 +3616,9 @@ fn archive_review_file(pr_number: u32) -> ApiResult<()> {
         .ok()
         .and_then(|o| {
             if o.status.success() {
-                String::from_utf8(o.stdout).ok().map(|s| s.trim().to_string())
+                String::from_utf8(o.stdout)
+                    .ok()
+                    .map(|s| s.trim().to_string())
             } else {
                 None
             }
