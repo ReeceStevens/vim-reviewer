@@ -845,10 +845,11 @@ fn vim_reviewer() -> oxi::Result<()> {
             if let Some(StatusLineAction::OpenFile(path)) = action {
                 let config = get_config_from_file();
                 if let Some(pr_number) = config.and_then(|c| c.active_pr)
-                    && let Some(mut review) = Review::get_review(pr_number) {
-                        review.toggle_viewed(&path);
-                        review.save();
-                    }
+                    && let Some(mut review) = Review::get_review(pr_number)
+                {
+                    review.toggle_viewed(&path);
+                    review.save();
+                }
                 let saved_cursor = api::get_current_win().get_cursor()?;
                 refresh_status_buffer()?;
                 let _ = api::get_current_win().set_cursor(saved_cursor.0, saved_cursor.1);
