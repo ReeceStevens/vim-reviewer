@@ -49,12 +49,14 @@ enum StatusLineAction {
         path: String,
         line: u32,
         side: Side,
+        orphaned: bool,
     },
     ToggleComment {
         idx: usize,
         path: String,
         line: u32,
         side: Side,
+        orphaned: bool,
     },
 }
 
@@ -476,6 +478,7 @@ fn vim_reviewer() -> oxi::Result<()> {
                     }
                     let (side, path) = get_current_buffer_path()?;
                     let multi_line = args.line1 != args.line2;
+                    let commit_hash = current_head_sha();
                     review.in_progress_comment = Some(Comment::new(
                         "".to_string(),
                         args.line2 as u32,
@@ -487,6 +490,7 @@ fn vim_reviewer() -> oxi::Result<()> {
                             (args.line1 - 1) as u32
                         }),
                         Some(side),
+                        commit_hash,
                     ));
                     review.save();
                     new_temporary_buffer(Some("SaveComment new"))?;
@@ -688,12 +692,14 @@ fn vim_reviewer() -> oxi::Result<()> {
                     let comments: Array = review
                         .comments
                         .iter()
-                        .map(|comment| {
-                            Dictionary::from_iter([
+                        .filter_map(|comment| {
+                            // Skip orphaned comments — they have no anchor at HEAD.
+                            let (_, end) = comment_current_range_at_head(comment)?;
+                            Some(Dictionary::from_iter([
                                 ("filename", Object::from(comment.path.clone())),
-                                ("lnum", Object::from(comment.line)),
+                                ("lnum", Object::from(end)),
                                 ("text", Object::from(comment.body.clone())),
-                            ])
+                            ]))
                         })
                         .collect();
                     api::call_function::<_, i32>("setqflist", (comments, " "))?;
@@ -777,9 +783,15 @@ fn vim_reviewer() -> oxi::Result<()> {
                         );
                     }
                 }
-                Some(StatusLineAction::JumpToComment { path, line, side })
-                | Some(StatusLineAction::ToggleComment { path, line, side, .. }) => {
-                    jump_to_comment_in_diff(&path, line, side, base_branch)?;
+                Some(StatusLineAction::JumpToComment { path, line, side, orphaned })
+                | Some(StatusLineAction::ToggleComment {
+                    path, line, side, orphaned, ..
+                }) => {
+                    if orphaned {
+                        api::err_writeln("Comment anchor was deleted in a later commit.");
+                    } else {
+                        jump_to_comment_in_diff(&path, line, side, base_branch)?;
+                    }
                 }
                 _ => {}
             }
@@ -902,8 +914,11 @@ fn place_review_signs() -> ApiResult<()> {
         };
 
         for comment in review.comments.iter().filter(|c| c.path == rel_path) {
-            let start_line = comment.start_line.unwrap_or(comment.line);
-            let end_line = comment.line;
+            // Skip orphaned comments (anchor line was deleted between commit_hash and HEAD).
+            let (start_line, end_line) = match comment_current_range_at_head(comment) {
+                Some(r) => r,
+                None => continue,
+            };
             for line in start_line..=end_line {
                 sign_idx += 1;
                 let name = if start_line == end_line || (line != start_line && line != end_line) {
@@ -1312,10 +1327,25 @@ fn build_status_lines(
             .collect();
 
         for (_review_comment_idx, comment) in &file_comments {
-            let line_display = match comment.start_line {
-                Some(sl) if sl != comment.line => format!("L{}-{}", sl, comment.line),
-                _ => format!("L{}", comment.line),
+            let mapped = comment_current_range_at_head(comment);
+            let orphaned = mapped.is_none();
+            let orig_start = comment.start_line.unwrap_or(comment.line);
+            let orig_end = comment.line;
+            let (disp_start, disp_end) = mapped.unwrap_or((orig_start, orig_end));
+            let line_display = if orphaned {
+                if orig_start != orig_end {
+                    format!("L{}-{} (deleted)", orig_start, orig_end)
+                } else {
+                    format!("L{} (deleted)", orig_end)
+                }
+            } else if disp_start != disp_end {
+                format!("L{}-{}", disp_start, disp_end)
+            } else {
+                format!("L{}", disp_end)
             };
+            // For jumps we want the mapped line if available; for orphans we just
+            // pass through orig_end — the Enter handler refuses to jump anyway.
+            let jump_line = disp_end;
 
             if expanded.contains(&comment_global_idx) {
                 // Show full comment body (indented)
@@ -1324,15 +1354,17 @@ fn build_status_lines(
                 actions.push(StatusLineAction::ToggleComment {
                     idx: comment_global_idx,
                     path: fc.path.clone(),
-                    line: comment.line,
+                    line: jump_line,
                     side: comment.side,
+                    orphaned,
                 });
                 for body_line in comment.body.lines() {
                     lines.push(format!("         {}", body_line));
                     actions.push(StatusLineAction::JumpToComment {
                         path: fc.path.clone(),
-                        line: comment.line,
+                        line: jump_line,
                         side: comment.side,
+                        orphaned,
                     });
                 }
             } else {
@@ -1348,8 +1380,9 @@ fn build_status_lines(
                 actions.push(StatusLineAction::ToggleComment {
                     idx: comment_global_idx,
                     path: fc.path.clone(),
-                    line: comment.line,
+                    line: jump_line,
                     side: comment.side,
+                    orphaned,
                 });
             }
             comment_global_idx += 1;
@@ -1609,6 +1642,7 @@ fn test_build_status_lines_with_comments() {
             42,
             "src/lib.rs".to_string(),
             Side::RIGHT,
+            None,
             None,
             None,
         )],
@@ -1906,6 +1940,8 @@ pub struct Comment {
     side: Side,
     start_line: Option<u32>,
     start_side: Option<Side>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    commit_hash: Option<String>,
 }
 
 impl Comment {
@@ -1916,6 +1952,7 @@ impl Comment {
         side: Side,
         start_line: Option<u32>,
         start_side: Option<Side>,
+        commit_hash: Option<String>,
     ) -> Self {
         Comment {
             body,
@@ -1924,6 +1961,7 @@ impl Comment {
             side,
             start_line,
             start_side,
+            commit_hash,
         }
     }
 }
@@ -1945,7 +1983,7 @@ pub struct PrInfo {
     files_changed: Vec<FileChange>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Review {
     owner: String,
     repo: String,
@@ -2010,6 +2048,31 @@ impl Review {
         }
     }
 
+    /// Return a publish-ready clone of `self.comments`: each comment's `line` and
+    /// `start_line` are mapped from its `commit_hash` to `target_sha`. Orphaned
+    /// comments (anchor line was deleted) are omitted, with one warning per skip.
+    fn comments_for_publish(&self, target_sha: &str, repo: &Repository) -> Vec<Comment> {
+        self.comments
+            .iter()
+            .filter_map(|c| match comment_current_range(c, target_sha, repo) {
+                Some((start, end)) => {
+                    let mut mapped = c.clone();
+                    mapped.line = end;
+                    // Preserve start_line's Some/None shape (multi-line vs single).
+                    mapped.start_line = c.start_line.map(|_| start);
+                    Some(mapped)
+                }
+                None => {
+                    api::err_writeln(&format!(
+                        "Skipping orphaned comment at {} L{} (anchor line was deleted).",
+                        c.path, c.line
+                    ));
+                    None
+                }
+            })
+            .collect()
+    }
+
     fn publish_github(&self, token: String) -> Result<reqwest::blocking::Response, reqwest::Error> {
         let client = reqwest::blocking::Client::new();
         fn header_map(token: String) -> HeaderMap {
@@ -2025,9 +2088,21 @@ impl Review {
             headers.insert(USER_AGENT, HeaderValue::from_static("vim-reviewer"));
             headers
         }
+        // Map comments forward from their `commit_hash` to local HEAD (the user's
+        // intended publish target). If the repo or HEAD can't be resolved, fall
+        // back to sending the comments as-stored — at worst this is the pre-
+        // commit-hash behavior.
+        let body = match (Repository::open_from_env(), current_head_sha()) {
+            (Ok(repo), Some(head_sha)) => {
+                let mut mapped = self.clone();
+                mapped.comments = self.comments_for_publish(&head_sha, &repo);
+                serde_json::to_value(&mapped).unwrap_or_else(|_| serde_json::json!(&self))
+            }
+            _ => serde_json::to_value(self).unwrap_or(serde_json::Value::Null),
+        };
         client
             .post(self.post_url())
-            .json(&self)
+            .json(&body)
             .headers(header_map(token))
             .send()
     }
@@ -2094,8 +2169,26 @@ impl Review {
         let start_sha = mr_data["diff_refs"]["start_sha"].as_str().unwrap_or("");
         let head_sha = mr_data["diff_refs"]["head_sha"].as_str().unwrap_or("");
 
+        // Open the repo once for line-mapping work in this loop.
+        let repo = match Repository::open_from_env() {
+            Ok(r) => Some(r),
+            Err(e) => {
+                api::err_writeln(&format!(
+                    "Failed to open git repository: {} (publishing with stored line numbers).",
+                    e
+                ));
+                None
+            }
+        };
+        // Map each comment's stored line (anchored at `comment.commit_hash`)
+        // forward to GitLab's view (`head_sha`). Orphaned comments are skipped.
+        let publish_comments: Vec<Comment> = match &repo {
+            Some(repo) => self.comments_for_publish(head_sha, repo),
+            None => self.comments.clone(),
+        };
+
         // Now create discussion threads for each comment
-        for comment in &self.comments {
+        for comment in &publish_comments {
             // For multi-line comments, use start_line and line (end line)
             // For single-line comments, start_line will be line-1, so use line for both
             let is_multi_line =
@@ -2158,18 +2251,17 @@ impl Review {
                 hasher.update(comment_path.as_bytes());
                 let file_hash = format!("{:x}", hasher.finalize());
 
-                // Get the repository to look up line mappings
-                let repo = match Repository::open_from_env() {
-                    Ok(r) => r,
-                    Err(e) => {
-                        api::err_writeln(&format!("Failed to open git repository: {}", e));
-                        continue;
-                    }
+                // Reuse the repo opened at the top of the loop. If it failed
+                // earlier, we can't compute line_range — fall back to letting
+                // the position stand without it.
+                let repo = match repo.as_ref() {
+                    Some(r) => r,
+                    None => continue,
                 };
 
                 // Get old/new line mappings for start and end lines
                 let (start_old, start_new) = match get_line_mapping(
-                    &repo,
+                    repo,
                     &comment_path,
                     base_sha,
                     head_sha,
@@ -2187,7 +2279,7 @@ impl Review {
                 };
 
                 let (end_old, end_new) = match get_line_mapping(
-                    &repo,
+                    repo,
                     &comment_path,
                     base_sha,
                     head_sha,
@@ -2330,23 +2422,21 @@ impl Review {
     /// Return the first comment in this review whose span contains the requested file path and
     /// line.
     pub fn get_comment_at_position(&self, path: String, line: u32) -> Option<(usize, &Comment)> {
-        let eligible_comments: Vec<(usize, &Comment)> = self
-            .comments
+        // Match the cursor line (which is at working-tree HEAD) against each
+        // comment's range mapped from its `commit_hash` to HEAD. Orphaned
+        // comments (anchor line was deleted) never match.
+        self.comments
             .iter()
             .enumerate()
-            .filter(|(_idx, comment)| {
-                comment.path == path
-                    && (comment.line == line
-                        || (comment.start_line.is_some()
-                            && comment.start_line.unwrap() <= line
-                            && comment.line >= line))
+            .find(|(_idx, comment)| {
+                if comment.path != path {
+                    return false;
+                }
+                match comment_current_range_at_head(comment) {
+                    Some((start, end)) => start <= line && line <= end,
+                    None => false,
+                }
             })
-            .collect();
-        if !eligible_comments.is_empty() {
-            Some(eligible_comments[0])
-        } else {
-            None
-        }
     }
 
     pub fn delete_comment(&mut self, comment: &Comment) {
@@ -2401,7 +2491,7 @@ impl Review {
 /// If the line is only in the new file (added), old_line will be None
 fn get_line_mapping(
     repo: &Repository,
-    _file_path: &str,
+    file_path: &str,
     base_sha: &str,
     head_sha: &str,
     line_number: u32,
@@ -2427,16 +2517,29 @@ fn get_line_mapping(
         .tree()
         .map_err(|e| format!("Failed to get head tree: {}", e))?;
 
-    // Create diff
+    // Create diff with an effectively infinite context window so EVERY line of
+    // the file is emitted (as ' ', '+', or '-'). Without this, lines outside
+    // any hunk are missing from the line map and the loop below falls through
+    // to the "unchanged" fallback even when a prior hunk shifted them.
+    let mut diff_opts = git2::DiffOptions::new();
+    diff_opts.context_lines(u32::MAX / 2);
     let diff = repo
-        .diff_tree_to_tree(Some(&base_tree), Some(&head_tree), None)
+        .diff_tree_to_tree(Some(&base_tree), Some(&head_tree), Some(&mut diff_opts))
         .map_err(|e| format!("Failed to create diff: {}", e))?;
 
     // Find the file in the diff and build line mapping
     let mut line_map: Vec<(Option<u32>, Option<u32>)> = Vec::new();
 
     diff.foreach(
-        &mut |_delta, _progress| true,
+        &mut |delta, _progress| {
+            let path_matches = |f: git2::DiffFile<'_>| {
+                f.path()
+                    .and_then(|p| p.to_str())
+                    .map(|s| s == file_path)
+                    .unwrap_or(false)
+            };
+            path_matches(delta.new_file()) || path_matches(delta.old_file())
+        },
         None,
         None,
         Some(&mut |_delta, _hunk, line| {
@@ -2482,6 +2585,124 @@ fn get_line_mapping(
 
     // If not found in diff, the line is unchanged - both old and new have same number
     Ok((Some(line_number), Some(line_number)))
+}
+
+/// Resolve the current HEAD's commit SHA, or `None` if outside a repo / no HEAD.
+/// Emits a visible warning on either failure so silent loss of `commit_hash`
+/// (e.g. at `:ReviewComment` time) is debuggable.
+fn current_head_sha() -> Option<String> {
+    let repo = match Repository::open_from_env() {
+        Ok(r) => r,
+        Err(e) => {
+            api::err_writeln(&format!(
+                "[vim-reviewer] current_head_sha: failed to open repo: {}",
+                e
+            ));
+            return None;
+        }
+    };
+    match repo.revparse_single("HEAD") {
+        Ok(obj) => Some(obj.id().to_string()),
+        Err(e) => {
+            api::err_writeln(&format!(
+                "[vim-reviewer] current_head_sha: failed to resolve HEAD: {}",
+                e
+            ));
+            None
+        }
+    }
+}
+
+/// Map a comment's stored line range (anchored at `comment.commit_hash`) to the
+/// line range at `target_sha`.
+///
+/// Returns:
+/// - `Some((start, end))` mapped to `target_sha`, OR original range when no
+///   remapping is needed (LEFT-side comment, missing `commit_hash`, hash equal
+///   to target) or when git2 fails (graceful fallback so the comment stays
+///   visible).
+/// - `None` when an anchor line was deleted between `commit_hash` and
+///   `target_sha` (orphaned).
+fn comment_current_range(
+    comment: &Comment,
+    target_sha: &str,
+    repo: &Repository,
+) -> Option<(u32, u32)> {
+    let orig_start = comment.start_line.unwrap_or(comment.line);
+    let orig_end = comment.line;
+    if comment.side == Side::LEFT {
+        return Some((orig_start, orig_end));
+    }
+    let commit_hash = match &comment.commit_hash {
+        Some(h) => h,
+        None => return Some((orig_start, orig_end)),
+    };
+    if commit_hash == target_sha {
+        return Some((orig_start, orig_end));
+    }
+    let map_one = |line: u32| -> Result<Option<u32>, String> {
+        match get_line_mapping(repo, &comment.path, commit_hash, target_sha, line, Side::LEFT) {
+            Ok((_, mapped)) => Ok(mapped),
+            Err(e) => Err(e),
+        }
+    };
+    let start_mapped = match map_one(orig_start) {
+        Ok(Some(n)) => n,
+        Ok(None) => return None,
+        Err(e) => {
+            api::err_writeln(&format!(
+                "[vim-reviewer] line mapping failed for {} L{} ({}..{}): {} \u{2014} using stored line.",
+                comment.path, orig_start, commit_hash, target_sha, e
+            ));
+            return Some((orig_start, orig_end));
+        }
+    };
+    let end_mapped = if orig_end == orig_start {
+        start_mapped
+    } else {
+        match map_one(orig_end) {
+            Ok(Some(n)) => n,
+            Ok(None) => return None,
+            Err(e) => {
+                api::err_writeln(&format!(
+                    "[vim-reviewer] line mapping failed for {} L{} ({}..{}): {} \u{2014} using stored line.",
+                    comment.path, orig_end, commit_hash, target_sha, e
+                ));
+                return Some((orig_start, orig_end));
+            }
+        }
+    };
+    Some((start_mapped.min(end_mapped), start_mapped.max(end_mapped)))
+}
+
+/// Convenience: map relative to current local HEAD. Opens its own `Repository`.
+fn comment_current_range_at_head(comment: &Comment) -> Option<(u32, u32)> {
+    let orig_start = comment.start_line.unwrap_or(comment.line);
+    let orig_end = comment.line;
+    if comment.side == Side::LEFT || comment.commit_hash.is_none() {
+        return Some((orig_start, orig_end));
+    }
+    let repo = match Repository::open_from_env() {
+        Ok(r) => r,
+        Err(e) => {
+            api::err_writeln(&format!(
+                "[vim-reviewer] mapping {}: failed to open repo: {} \u{2014} using stored line.",
+                comment.path, e
+            ));
+            return Some((orig_start, orig_end));
+        }
+    };
+    let head_sha = match repo.revparse_single("HEAD") {
+        Ok(obj) => obj.id().to_string(),
+        Err(e) => {
+            api::err_writeln(&format!(
+                "[vim-reviewer] mapping {}: failed to resolve HEAD: {} \u{2014} using stored line.",
+                comment.path, e
+            ));
+            return Some((orig_start, orig_end));
+        }
+    };
+    comment_current_range(comment, &head_sha, &repo)
 }
 
 fn get_review_directory() -> PathBuf {
