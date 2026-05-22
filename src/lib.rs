@@ -344,7 +344,7 @@ fn vim_reviewer() -> oxi::Result<()> {
     // Auto-place signs on file load so files opened after `:StartReview` get
     // gutter markers without a manual `:UpdateReviewSigns`. `place_review_signs`
     // is a cheap no-op when no review is active.
-    api::command("autocmd BufRead * silent! UpdateReviewSigns")?;
+    api::command("autocmd BufRead,BufWritePost * silent! UpdateReviewSigns")?;
 
     create_command!(
         "StartReview",
@@ -394,6 +394,91 @@ fn vim_reviewer() -> oxi::Result<()> {
                     }
 
                     place_review_signs()?;
+                    Ok(())
+                }
+            }
+        }
+    );
+
+    create_command!(
+        "FetchReview",
+        "Download the most recent submitted review and save it locally: FetchReview <pr_number> [base_branch]",
+        CommandNArgs::OneOrMore,
+        |args: CommandArgs| -> ApiResult<()> {
+            match get_config_from_file() {
+                None => {
+                    api::err_writeln("Could not read configuration file.");
+                    Ok(())
+                }
+                Some(mut config) => {
+                    let raw = args.args.unwrap_or_default();
+                    let parts: Vec<&str> = raw.split_whitespace().collect();
+                    if parts.is_empty() {
+                        api::err_writeln("Usage: FetchReview <pr_number> [base_branch]");
+                        return Ok(());
+                    }
+                    let pr_number = match str::parse::<u32>(parts[0]) {
+                        Ok(n) => n,
+                        Err(_) => {
+                            api::err_writeln("Invalid PR number.");
+                            return Ok(());
+                        }
+                    };
+
+                    let (token_var, backend_name) = match config.backend {
+                        GitBackend::GitHub => ("GH_REVIEW_API_TOKEN", "GitHub"),
+                        GitBackend::GitLab => ("GITLAB_TOKEN", "GitLab"),
+                    };
+                    let token = match env::var(token_var) {
+                        Ok(t) => t,
+                        Err(_) => {
+                            api::err_writeln(&format!(
+                                "{} environment variable not set; cannot fetch from {}.",
+                                token_var, backend_name
+                            ));
+                            return Ok(());
+                        }
+                    };
+
+                    let fetched = match config.backend {
+                        GitBackend::GitHub => fetch_review_github(&config, pr_number, &token),
+                        GitBackend::GitLab => fetch_review_gitlab(&config, pr_number, &token),
+                    };
+                    let review = match fetched {
+                        Some(r) => r,
+                        None => {
+                            api::err_writeln(&format!("No reviews found on PR {}.", pr_number));
+                            return Ok(());
+                        }
+                    };
+                    let comment_count = review.comments.len();
+
+                    config.active_pr = Some(pr_number);
+                    let base_branch = if parts.len() > 1 {
+                        parts[1].to_string()
+                    } else {
+                        detect_default_branch().unwrap_or_else(|| "main".to_string())
+                    };
+                    config.base_branch = Some(base_branch);
+                    update_configuration(config);
+
+                    review.save();
+
+                    // Cache PR info enrichment if possible (mirrors :StartReview).
+                    if let Some(config) = get_config_from_file()
+                        && let Some(pr_info) = fetch_pr_info_from_api(&config, pr_number)
+                        && let Ok(json) = serde_json::to_string(&pr_info)
+                        && let Ok(mut file) = File::create(get_pr_info_cache_path(pr_number))
+                    {
+                        let _ = file.write_all(json.as_bytes());
+                    }
+
+                    place_review_signs()?;
+                    api::out_write(string!(
+                        "Fetched {} comment(s) for PR #{}.\n",
+                        comment_count,
+                        pr_number
+                    ));
                     Ok(())
                 }
             }
@@ -457,6 +542,37 @@ fn vim_reviewer() -> oxi::Result<()> {
                     api::err_writeln("Cannot publish since no review is currently active.");
                 }
             };
+            Ok(())
+        }
+    );
+
+    create_command!(
+        "ClearReview",
+        "Archive the current review to old-reviews/ and unset active_pr.",
+        CommandNArgs::ZeroOrOne,
+        |_args: CommandArgs| -> ApiResult<()> {
+            let mut config = match get_config_from_file() {
+                Some(c) => c,
+                None => {
+                    api::err_writeln("Could not read configuration file.");
+                    return Ok(());
+                }
+            };
+            let pr_number = match config.active_pr {
+                Some(n) => n,
+                None => {
+                    api::err_writeln("No active review to clear.");
+                    return Ok(());
+                }
+            };
+            archive_review_file(pr_number)?;
+            config.active_pr = None;
+            update_configuration(config);
+            clear_review_signs()?;
+            api::out_write(string!(
+                "Archived review #{} to old-reviews/.\n",
+                pr_number
+            ));
             Ok(())
         }
     );
@@ -694,7 +810,7 @@ fn vim_reviewer() -> oxi::Result<()> {
                         .iter()
                         .filter_map(|comment| {
                             // Skip orphaned comments — they have no anchor at HEAD.
-                            let (_, end) = comment_current_range_at_head(comment)?;
+                            let (_, end) = comment_current_range_in_workdir(comment)?;
                             Some(Dictionary::from_iter([
                                 ("filename", Object::from(comment.path.clone())),
                                 ("lnum", Object::from(end)),
@@ -924,7 +1040,7 @@ fn place_review_signs() -> ApiResult<()> {
 
         for comment in review.comments.iter().filter(|c| c.path == rel_path) {
             // Skip orphaned comments (anchor line was deleted between commit_hash and HEAD).
-            let (start_line, end_line) = match comment_current_range_at_head(comment) {
+            let (start_line, end_line) = match comment_current_range_in_workdir(comment) {
                 Some(r) => r,
                 None => continue,
             };
@@ -1242,6 +1358,244 @@ fn fetch_pr_info_from_api(config: &Config, pr_number: u32) -> Option<PrInfo> {
     }
 }
 
+/// Fetch the most recent submitted review on a GitHub PR and translate its
+/// inline comments into our `Review`/`Comment` shape. Returns `None` if the PR
+/// has no submitted reviews or if the HTTP/parsing fails. Caller is responsible
+/// for setting `config.active_pr` and persisting the result.
+fn fetch_review_github(config: &Config, pr_number: u32, token: &str) -> Option<Review> {
+    let client = reqwest::blocking::Client::new();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static("application/vnd.github+json"),
+    );
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("token {}", token)).ok()?,
+    );
+    headers.insert(USER_AGENT, HeaderValue::from_static("vim-reviewer"));
+
+    // Step 1: list reviews on the PR, pick the most recently submitted one.
+    let reviews_url = format!(
+        "https://api.github.com/repos/{}/{}/pulls/{}/reviews",
+        config.owner, config.repo, pr_number
+    );
+    let resp = client.get(&reviews_url).headers(headers.clone()).send().ok()?;
+    if !resp.status().is_success() {
+        api::err_writeln(&format!(
+            "GitHub returned {} listing reviews for PR {}.",
+            resp.status(),
+            pr_number
+        ));
+        return None;
+    }
+    let reviews: serde_json::Value = resp.json().ok()?;
+    let mut submitted: Vec<&serde_json::Value> = reviews
+        .as_array()?
+        .iter()
+        .filter(|r| !r["submitted_at"].is_null())
+        .collect();
+    submitted.sort_by(|a, b| {
+        b["submitted_at"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(a["submitted_at"].as_str().unwrap_or(""))
+    });
+    let chosen = submitted.first()?;
+    let review_id = chosen["id"].as_u64()?;
+    let review_body = chosen["body"].as_str().unwrap_or("").to_string();
+
+    // Step 2: list that review's inline comments.
+    let comments_url = format!(
+        "https://api.github.com/repos/{}/{}/pulls/{}/reviews/{}/comments",
+        config.owner, config.repo, pr_number, review_id
+    );
+    let resp = client.get(&comments_url).headers(headers.clone()).send().ok()?;
+    if !resp.status().is_success() {
+        api::err_writeln(&format!(
+            "GitHub returned {} listing review #{} comments.",
+            resp.status(),
+            review_id
+        ));
+        return None;
+    }
+    let raw_comments: serde_json::Value = resp.json().ok()?;
+    let raw_array = raw_comments.as_array();
+    let raw_count = raw_array.map(|a| a.len()).unwrap_or(0);
+
+    // If any comment lacks `line`/`original_line`, GitHub stored it as a
+    // diff-position (legacy field) anchored against the FULL file patch.
+    // Fetch /pulls/{n}/files once so we can translate those positions.
+    let needs_patches = raw_array
+        .map(|arr| {
+            arr.iter()
+                .any(|c| c["line"].is_null() && c["original_line"].is_null())
+        })
+        .unwrap_or(false);
+    let patches = if needs_patches {
+        fetch_github_pr_patches(&client, &headers, config, pr_number)
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    let comments: Vec<Comment> = raw_array
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| {
+                    let path = c["path"].as_str()?.to_string();
+                    let body = c["body"].as_str().unwrap_or("").to_string();
+                    let commit_hash = c["commit_id"]
+                        .as_str()
+                        .or_else(|| c["original_commit_id"].as_str())
+                        .map(|s| s.to_string());
+                    let start_line = c["start_line"]
+                        .as_u64()
+                        .or_else(|| c["original_start_line"].as_u64())
+                        .map(|n| n as u32);
+
+                    // Modern API: `line` + `side` are file-line / LEFT|RIGHT.
+                    let (line, side) = if let Some(l) =
+                        c["line"].as_u64().or_else(|| c["original_line"].as_u64())
+                    {
+                        let s = c["side"].as_str().map(parse_side).unwrap_or(Side::RIGHT);
+                        (l as u32, s)
+                    } else {
+                        // Older API: comment was placed via `position` (1-indexed
+                        // offset into the FULL file patch). Walk the patch we
+                        // fetched from /pulls/{n}/files to translate.
+                        let position = c["position"]
+                            .as_u64()
+                            .or_else(|| c["original_position"].as_u64())
+                            .map(|n| n as u32)?;
+                        let patch = patches.get(&path)?;
+                        parse_patch_position(patch, position)?
+                    };
+
+                    let start_side = c["start_side"].as_str().map(parse_side);
+                    Some(Comment::new(
+                        body,
+                        line,
+                        path,
+                        side,
+                        start_line,
+                        start_side,
+                        commit_hash,
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let kept = comments.len();
+    if kept != raw_count {
+        api::err_writeln(&format!(
+            "[vim-reviewer] GitHub returned {} comment(s) for review #{}, parsed {}.",
+            raw_count, review_id, kept
+        ));
+    }
+
+    Some(Review::new(
+        config.owner.clone(),
+        config.repo.clone(),
+        config.backend.clone(),
+        config.backend_url.clone(),
+        pr_number,
+        review_body,
+        comments,
+    ))
+}
+
+/// Fetch positioned discussion notes on a GitLab MR. GitLab has no explicit
+/// "review" concept, so we collect every discussion whose first note carries
+/// position metadata (i.e. inline comments) and treat them collectively as the
+/// review to work through. Returns `None` if no such discussions exist.
+fn fetch_review_gitlab(config: &Config, pr_number: u32, token: &str) -> Option<Review> {
+    let client = reqwest::blocking::Client::new();
+    let base_url = config
+        .backend_url
+        .as_deref()
+        .unwrap_or("https://gitlab.com");
+    let encoded_project = format!("{}/{}", config.owner, config.repo).replace("/", "%2F");
+    let url = format!(
+        "{}/api/v4/projects/{}/merge_requests/{}/discussions",
+        base_url, encoded_project, pr_number
+    );
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {}", token)).ok()?,
+    );
+    headers.insert(USER_AGENT, HeaderValue::from_static("vim-reviewer"));
+
+    let resp = client.get(&url).headers(headers).send().ok()?;
+    if !resp.status().is_success() {
+        api::err_writeln(&format!(
+            "GitLab returned {} listing discussions for MR {}.",
+            resp.status(),
+            pr_number
+        ));
+        return None;
+    }
+    let discussions: serde_json::Value = resp.json().ok()?;
+    let comments: Vec<Comment> = discussions
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|d| {
+                    let note = d["notes"].as_array()?.iter().find(|n| !n["position"].is_null())?;
+                    let pos = &note["position"];
+                    let new_line = pos["new_line"].as_u64().map(|n| n as u32);
+                    let old_line = pos["old_line"].as_u64().map(|n| n as u32);
+                    let (line, side) = match (new_line, old_line) {
+                        (Some(n), _) => (n, Side::RIGHT),
+                        (None, Some(o)) => (o, Side::LEFT),
+                        _ => return None,
+                    };
+                    let path = if side == Side::RIGHT {
+                        pos["new_path"].as_str()
+                    } else {
+                        pos["old_path"].as_str()
+                    }?
+                    .to_string();
+                    let body = note["body"].as_str().unwrap_or("").to_string();
+                    let start_line = if side == Side::RIGHT {
+                        pos["line_range"]["start"]["new_line"]
+                            .as_u64()
+                            .map(|n| n as u32)
+                    } else {
+                        pos["line_range"]["start"]["old_line"]
+                            .as_u64()
+                            .map(|n| n as u32)
+                    };
+                    let commit_hash = pos["head_sha"].as_str().map(|s| s.to_string());
+                    Some(Comment::new(
+                        body,
+                        line,
+                        path,
+                        side,
+                        start_line,
+                        Some(side),
+                        commit_hash,
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if comments.is_empty() {
+        return None;
+    }
+
+    Some(Review::new(
+        config.owner.clone(),
+        config.repo.clone(),
+        config.backend.clone(),
+        config.backend_url.clone(),
+        pr_number,
+        String::new(),
+        comments,
+    ))
+}
+
 /// Format a status char for display (e.g. "M" -> "M", "A" -> "A").
 fn format_file_status_char(status: &str) -> &str {
     match status {
@@ -1336,7 +1690,7 @@ fn build_status_lines(
             .collect();
 
         for (_review_comment_idx, comment) in &file_comments {
-            let mapped = comment_current_range_at_head(comment);
+            let mapped = comment_current_range_in_workdir(comment);
             let orphaned = mapped.is_none();
             let orig_start = comment.start_line.unwrap_or(comment.line);
             let orig_end = comment.line;
@@ -1932,6 +2286,132 @@ pub enum Side {
     LEFT,
 }
 
+/// Translate a GitHub/GitLab `side` string into the local enum. Defaults to
+/// `RIGHT` for missing or unknown values (the common case for inline review
+/// comments on the new code).
+fn parse_side(s: &str) -> Side {
+    match s {
+        "LEFT" | "left" | "old" => Side::LEFT,
+        _ => Side::RIGHT,
+    }
+}
+
+/// Parse a unified-diff `@@ -OLD,N +NEW,M @@` header and return the two
+/// starting line numbers, or `None` if either is missing/unparseable.
+fn parse_hunk_header(header: &str) -> Option<(u32, u32)> {
+    let mut old_start: Option<u32> = None;
+    let mut new_start: Option<u32> = None;
+    for token in header.split_whitespace() {
+        if let Some(rest) = token.strip_prefix('-')
+            && let Some(num_str) = rest.split(',').next()
+            && let Ok(n) = num_str.parse::<u32>()
+        {
+            old_start = Some(n);
+        } else if let Some(rest) = token.strip_prefix('+')
+            && let Some(num_str) = rest.split(',').next()
+            && let Ok(n) = num_str.parse::<u32>()
+        {
+            new_start = Some(n);
+        }
+    }
+    Some((old_start?, new_start?))
+}
+
+/// Walk a full file `patch` (from `GET /pulls/{n}/files`) to translate
+/// GitHub's `position` field — a 1-indexed offset from the FIRST `@@` header
+/// counting every subsequent line, including additional `@@` headers — into
+/// a `(file_line, side)` pair. The side is inferred from the line marker:
+/// `+` and ` ` → RIGHT, `-` → LEFT. Returns `None` if the patch is malformed
+/// or the position is out of range.
+fn parse_patch_position(patch: &str, position: u32) -> Option<(u32, Side)> {
+    let mut old_line: u32 = 0;
+    let mut new_line: u32 = 0;
+    let mut pos: u32 = 0;
+    let mut first_header_seen = false;
+
+    for line in patch.lines() {
+        if line.starts_with("@@") {
+            let (o, n) = parse_hunk_header(line)?;
+            if first_header_seen {
+                // Subsequent hunk headers themselves consume a position.
+                pos += 1;
+                if pos == position {
+                    return None; // pointing at a header is nonsensical
+                }
+            }
+            first_header_seen = true;
+            old_line = o;
+            new_line = n;
+            continue;
+        }
+        if !first_header_seen {
+            continue;
+        }
+        pos += 1;
+        let at_target = pos == position;
+        let first = line.chars().next().unwrap_or(' ');
+        match first {
+            ' ' => {
+                if at_target {
+                    return Some((new_line, Side::RIGHT));
+                }
+                old_line += 1;
+                new_line += 1;
+            }
+            '+' => {
+                if at_target {
+                    return Some((new_line, Side::RIGHT));
+                }
+                new_line += 1;
+            }
+            '-' => {
+                if at_target {
+                    return Some((old_line, Side::LEFT));
+                }
+                old_line += 1;
+            }
+            _ => {} // e.g. "\ No newline at end of file" — counts toward position
+        }
+    }
+    None
+}
+
+/// Fetch the per-file patches for a GitHub PR. Returns `path → patch` so
+/// position-anchored review comments can be translated to file lines.
+fn fetch_github_pr_patches(
+    client: &reqwest::blocking::Client,
+    headers: &HeaderMap,
+    config: &Config,
+    pr_number: u32,
+) -> std::collections::HashMap<String, String> {
+    let url = format!(
+        "https://api.github.com/repos/{}/{}/pulls/{}/files?per_page=100",
+        config.owner, config.repo, pr_number
+    );
+    let mut out = std::collections::HashMap::new();
+    let resp = match client.get(&url).headers(headers.clone()).send() {
+        Ok(r) => r,
+        Err(_) => return out,
+    };
+    if !resp.status().is_success() {
+        return out;
+    }
+    let files: serde_json::Value = match resp.json() {
+        Ok(v) => v,
+        Err(_) => return out,
+    };
+    if let Some(arr) = files.as_array() {
+        for f in arr {
+            if let (Some(filename), Some(patch)) =
+                (f["filename"].as_str(), f["patch"].as_str())
+            {
+                out.insert(filename.to_string(), patch.to_string());
+            }
+        }
+    }
+    out
+}
+
 #[derive(Serialize, Deserialize, PartialEq, Clone)]
 pub struct Comment {
     body: String,
@@ -2429,7 +2909,7 @@ impl Review {
             if comment.path != path {
                 return false;
             }
-            match comment_current_range_at_head(comment) {
+            match comment_current_range_in_workdir(comment) {
                 Some((start, end)) => start <= line && line <= end,
                 None => false,
             }
@@ -2482,51 +2962,17 @@ impl Review {
     }
 }
 
-/// Get the old and new line numbers for a given line in a diff
-/// Returns (Option<old_line>, Option<new_line>)
-/// If the line is only in the old file (deleted), new_line will be None
-/// If the line is only in the new file (added), old_line will be None
-fn get_line_mapping(
-    repo: &Repository,
+/// Walk a built `Diff` and translate `line_number` (on `side`) to the
+/// corresponding line on the other side. Shared by both the tree-to-tree
+/// (`get_line_mapping`) and tree-to-workdir (`get_line_mapping_to_workdir`)
+/// flavors.
+fn extract_line_mapping_from_diff(
+    diff: &git2::Diff<'_>,
     file_path: &str,
-    base_sha: &str,
-    head_sha: &str,
     line_number: u32,
     side: Side,
 ) -> Result<(Option<u32>, Option<u32>), String> {
-    // Parse commit SHAs
-    let base_oid = git2::Oid::from_str(base_sha).map_err(|e| format!("Invalid base SHA: {}", e))?;
-    let head_oid = git2::Oid::from_str(head_sha).map_err(|e| format!("Invalid head SHA: {}", e))?;
-
-    // Get commit objects
-    let base_commit = repo
-        .find_commit(base_oid)
-        .map_err(|e| format!("Failed to find base commit: {}", e))?;
-    let head_commit = repo
-        .find_commit(head_oid)
-        .map_err(|e| format!("Failed to find head commit: {}", e))?;
-
-    // Get trees
-    let base_tree = base_commit
-        .tree()
-        .map_err(|e| format!("Failed to get base tree: {}", e))?;
-    let head_tree = head_commit
-        .tree()
-        .map_err(|e| format!("Failed to get head tree: {}", e))?;
-
-    // Create diff with an effectively infinite context window so EVERY line of
-    // the file is emitted (as ' ', '+', or '-'). Without this, lines outside
-    // any hunk are missing from the line map and the loop below falls through
-    // to the "unchanged" fallback even when a prior hunk shifted them.
-    let mut diff_opts = git2::DiffOptions::new();
-    diff_opts.context_lines(u32::MAX / 2);
-    let diff = repo
-        .diff_tree_to_tree(Some(&base_tree), Some(&head_tree), Some(&mut diff_opts))
-        .map_err(|e| format!("Failed to create diff: {}", e))?;
-
-    // Find the file in the diff and build line mapping
     let mut line_map: Vec<(Option<u32>, Option<u32>)> = Vec::new();
-
     diff.foreach(
         &mut |delta, _progress| {
             let path_matches = |f: git2::DiffFile<'_>| {
@@ -2541,18 +2987,9 @@ fn get_line_mapping(
         None,
         Some(&mut |_delta, _hunk, line| {
             match line.origin() {
-                ' ' => {
-                    // Context line - exists in both old and new
-                    line_map.push((line.old_lineno(), line.new_lineno()));
-                }
-                '-' => {
-                    // Deleted line - only in old
-                    line_map.push((line.old_lineno(), None));
-                }
-                '+' => {
-                    // Added line - only in new
-                    line_map.push((None, line.new_lineno()));
-                }
+                ' ' => line_map.push((line.old_lineno(), line.new_lineno())),
+                '-' => line_map.push((line.old_lineno(), None)),
+                '+' => line_map.push((None, line.new_lineno())),
                 _ => {}
             }
             true
@@ -2560,28 +2997,82 @@ fn get_line_mapping(
     )
     .map_err(|e| format!("Failed to process diff: {}", e))?;
 
-    // Find the mapping for the requested line
-    // The line_number is relative to the side (old or new)
     for (old_line, new_line) in &line_map {
         if side == Side::LEFT {
-            // Looking for old line number
             if let Some(old) = old_line
                 && *old == line_number
             {
                 return Ok((*old_line, *new_line));
             }
-        } else {
-            // Looking for new line number
-            if let Some(new) = new_line
-                && *new == line_number
-            {
-                return Ok((*old_line, *new_line));
-            }
+        } else if let Some(new) = new_line
+            && *new == line_number
+        {
+            return Ok((*old_line, *new_line));
         }
     }
-
-    // If not found in diff, the line is unchanged - both old and new have same number
+    // Not found in diff → line is unchanged.
     Ok((Some(line_number), Some(line_number)))
+}
+
+/// Get the old and new line numbers for a given line in a diff between two
+/// committed trees. Returns `(Option<old_line>, Option<new_line>)`; either
+/// side may be `None` for added/deleted lines.
+fn get_line_mapping(
+    repo: &Repository,
+    file_path: &str,
+    base_sha: &str,
+    head_sha: &str,
+    line_number: u32,
+    side: Side,
+) -> Result<(Option<u32>, Option<u32>), String> {
+    let base_oid = git2::Oid::from_str(base_sha).map_err(|e| format!("Invalid base SHA: {}", e))?;
+    let head_oid = git2::Oid::from_str(head_sha).map_err(|e| format!("Invalid head SHA: {}", e))?;
+    let base_commit = repo
+        .find_commit(base_oid)
+        .map_err(|e| format!("Failed to find base commit: {}", e))?;
+    let head_commit = repo
+        .find_commit(head_oid)
+        .map_err(|e| format!("Failed to find head commit: {}", e))?;
+    let base_tree = base_commit
+        .tree()
+        .map_err(|e| format!("Failed to get base tree: {}", e))?;
+    let head_tree = head_commit
+        .tree()
+        .map_err(|e| format!("Failed to get head tree: {}", e))?;
+
+    // Effectively-infinite context so every line of the file is emitted —
+    // see `extract_line_mapping_from_diff`.
+    let mut diff_opts = git2::DiffOptions::new();
+    diff_opts.context_lines(u32::MAX / 2);
+    let diff = repo
+        .diff_tree_to_tree(Some(&base_tree), Some(&head_tree), Some(&mut diff_opts))
+        .map_err(|e| format!("Failed to create diff: {}", e))?;
+    extract_line_mapping_from_diff(&diff, file_path, line_number, side)
+}
+
+/// Like `get_line_mapping`, but the "new" side is the current working tree
+/// (including uncommitted changes) rather than another committed tree.
+/// Use this for local UI mapping (gutter signs, hover lookup, etc.).
+fn get_line_mapping_to_workdir(
+    repo: &Repository,
+    file_path: &str,
+    base_sha: &str,
+    line_number: u32,
+    side: Side,
+) -> Result<(Option<u32>, Option<u32>), String> {
+    let base_oid = git2::Oid::from_str(base_sha).map_err(|e| format!("Invalid base SHA: {}", e))?;
+    let base_commit = repo
+        .find_commit(base_oid)
+        .map_err(|e| format!("Failed to find base commit: {}", e))?;
+    let base_tree = base_commit
+        .tree()
+        .map_err(|e| format!("Failed to get base tree: {}", e))?;
+    let mut diff_opts = git2::DiffOptions::new();
+    diff_opts.context_lines(u32::MAX / 2);
+    let diff = repo
+        .diff_tree_to_workdir(Some(&base_tree), Some(&mut diff_opts))
+        .map_err(|e| format!("Failed to create diff: {}", e))?;
+    extract_line_mapping_from_diff(&diff, file_path, line_number, side)
 }
 
 /// Resolve the current HEAD's commit SHA, or `None` if outside a repo / no HEAD.
@@ -2680,12 +3171,27 @@ fn comment_current_range(
 }
 
 /// Convenience: map relative to current local HEAD. Opens its own `Repository`.
-fn comment_current_range_at_head(comment: &Comment) -> Option<(u32, u32)> {
+/// Map a comment from its stored `commit_hash` to where it lives in the
+/// current working tree (including uncommitted edits). This is the function
+/// used by every local-UI surface (gutter signs, hover lookup, status buffer,
+/// quickfix, jump-to-comment).
+///
+/// Returns:
+/// - `Some((start, end))` mapped to the working-tree line numbers, OR original
+///   range when no remapping is needed / possible (LEFT-side comment, no
+///   `commit_hash`, or git2 fails — graceful fallback so comments stay visible).
+/// - `None` when an anchor line was deleted between `commit_hash` and the
+///   working tree (orphaned).
+fn comment_current_range_in_workdir(comment: &Comment) -> Option<(u32, u32)> {
     let orig_start = comment.start_line.unwrap_or(comment.line);
     let orig_end = comment.line;
-    if comment.side == Side::LEFT || comment.commit_hash.is_none() {
+    if comment.side == Side::LEFT {
         return Some((orig_start, orig_end));
     }
+    let commit_hash = match &comment.commit_hash {
+        Some(h) => h.clone(),
+        None => return Some((orig_start, orig_end)),
+    };
     let repo = match Repository::open_from_env() {
         Ok(r) => r,
         Err(e) => {
@@ -2696,17 +3202,39 @@ fn comment_current_range_at_head(comment: &Comment) -> Option<(u32, u32)> {
             return Some((orig_start, orig_end));
         }
     };
-    let head_sha = match repo.revparse_single("HEAD") {
-        Ok(obj) => obj.id().to_string(),
+    let map_one = |line: u32| -> Result<Option<u32>, String> {
+        match get_line_mapping_to_workdir(&repo, &comment.path, &commit_hash, line, Side::LEFT) {
+            Ok((_, mapped)) => Ok(mapped),
+            Err(e) => Err(e),
+        }
+    };
+    let start_mapped = match map_one(orig_start) {
+        Ok(Some(n)) => n,
+        Ok(None) => return None,
         Err(e) => {
             api::err_writeln(&format!(
-                "[vim-reviewer] mapping {}: failed to resolve HEAD: {} \u{2014} using stored line.",
-                comment.path, e
+                "[vim-reviewer] line mapping failed for {} L{} (from {}): {} \u{2014} using stored line.",
+                comment.path, orig_start, commit_hash, e
             ));
             return Some((orig_start, orig_end));
         }
     };
-    comment_current_range(comment, &head_sha, &repo)
+    let end_mapped = if orig_end == orig_start {
+        start_mapped
+    } else {
+        match map_one(orig_end) {
+            Ok(Some(n)) => n,
+            Ok(None) => return None,
+            Err(e) => {
+                api::err_writeln(&format!(
+                    "[vim-reviewer] line mapping failed for {} L{} (from {}): {} \u{2014} using stored line.",
+                    comment.path, orig_end, commit_hash, e
+                ));
+                return Some((orig_start, orig_end));
+            }
+        }
+    };
+    Some((start_mapped.min(end_mapped), start_mapped.max(end_mapped)))
 }
 
 fn get_review_directory() -> PathBuf {
@@ -2724,6 +3252,45 @@ fn get_review_directory() -> PathBuf {
 
 fn get_review_file_path(pr_number: u32) -> PathBuf {
     get_review_directory().join(Path::new(&format!("{}-review.json", pr_number)))
+}
+
+/// Move `<n>-review.json` into `<review-dir>/old-reviews/` with a timestamped
+/// filename. Idempotent: no-op (Ok) if the source file doesn't exist.
+fn archive_review_file(pr_number: u32) -> ApiResult<()> {
+    let current = get_review_file_path(pr_number);
+    if !current.exists() {
+        return Ok(());
+    }
+    let archive_dir = get_review_directory().join("old-reviews");
+    std::fs::create_dir_all(&archive_dir).map_err(|e| {
+        api::Error::Other(format!("Failed to create old-reviews dir: {}", e))
+    })?;
+
+    // Prefer a human-readable timestamp via `date`; fall back to epoch seconds
+    // if that fails (e.g. on platforms without `date`).
+    let ts = Command::new("date")
+        .arg("+%Y%m%d-%H%M%S")
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                String::from_utf8(o.stdout).ok().map(|s| s.trim().to_string())
+            } else {
+                None
+            }
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs().to_string())
+                .unwrap_or_else(|_| "unknown".to_string())
+        });
+
+    let dest = archive_dir.join(format!("{}-review-{}.json", pr_number, ts));
+    std::fs::rename(&current, &dest)
+        .map_err(|e| api::Error::Other(format!("Failed to archive review: {}", e)))?;
+    Ok(())
 }
 
 fn get_config_file_path() -> PathBuf {
