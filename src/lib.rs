@@ -783,9 +783,18 @@ fn vim_reviewer() -> oxi::Result<()> {
                         );
                     }
                 }
-                Some(StatusLineAction::JumpToComment { path, line, side, orphaned })
+                Some(StatusLineAction::JumpToComment {
+                    path,
+                    line,
+                    side,
+                    orphaned,
+                })
                 | Some(StatusLineAction::ToggleComment {
-                    path, line, side, orphaned, ..
+                    path,
+                    line,
+                    side,
+                    orphaned,
+                    ..
                 }) => {
                     if orphaned {
                         api::err_writeln("Comment anchor was deleted in a later commit.");
@@ -1812,12 +1821,7 @@ fn set_text_in_buffer(text: String) -> ApiResult<()> {
 /// Open (or focus the existing) Gvdiffsplit view of `path` and move the cursor to
 /// `line` on the side matching `side`. If a window in the current tab already shows
 /// `path` in diff mode, that window is reused — no extra split is created.
-fn jump_to_comment_in_diff(
-    path: &str,
-    line: u32,
-    side: Side,
-    base_branch: &str,
-) -> ApiResult<()> {
+fn jump_to_comment_in_diff(path: &str, line: u32, side: Side, base_branch: &str) -> ApiResult<()> {
     let abs_path: String = api::call_function("fnamemodify", (path, ":p"))?;
     let bufnr: i64 = api::call_function("bufnr", (abs_path,))?;
     let winid: i64 = if bufnr != -1 {
@@ -1884,10 +1888,8 @@ fn show_comment_hover(body: &str) -> ApiResult<()> {
         "nvim_set_option_value",
         ("modifiable", false, buf_scope.clone()),
     )?;
-    let _: Object = api::call_function(
-        "nvim_set_option_value",
-        ("filetype", "markdown", buf_scope),
-    )?;
+    let _: Object =
+        api::call_function("nvim_set_option_value", ("filetype", "markdown", buf_scope))?;
 
     let win_config = Dictionary::from_iter([
         ("relative", Object::from("cursor")),
@@ -1899,12 +1901,10 @@ fn show_comment_hover(body: &str) -> ApiResult<()> {
         ("border", Object::from("rounded")),
         ("focusable", Object::from(false)),
     ]);
-    let win_handle: i64 =
-        api::call_function("nvim_open_win", (buf_handle, false, win_config))?;
+    let win_handle: i64 = api::call_function("nvim_open_win", (buf_handle, false, win_config))?;
 
     let win_scope = Dictionary::from_iter([("win", Object::from(win_handle))]);
-    let _: Object =
-        api::call_function("nvim_set_option_value", ("wrap", true, win_scope))?;
+    let _: Object = api::call_function("nvim_set_option_value", ("wrap", true, win_scope))?;
 
     api::command(&format!(
         "autocmd CursorMoved,CursorMovedI,BufLeave,InsertEnter <buffer> ++once lua pcall(vim.api.nvim_win_close, {}, true)",
@@ -2425,18 +2425,15 @@ impl Review {
         // Match the cursor line (which is at working-tree HEAD) against each
         // comment's range mapped from its `commit_hash` to HEAD. Orphaned
         // comments (anchor line was deleted) never match.
-        self.comments
-            .iter()
-            .enumerate()
-            .find(|(_idx, comment)| {
-                if comment.path != path {
-                    return false;
-                }
-                match comment_current_range_at_head(comment) {
-                    Some((start, end)) => start <= line && line <= end,
-                    None => false,
-                }
-            })
+        self.comments.iter().enumerate().find(|(_idx, comment)| {
+            if comment.path != path {
+                return false;
+            }
+            match comment_current_range_at_head(comment) {
+                Some((start, end)) => start <= line && line <= end,
+                None => false,
+            }
+        })
     }
 
     pub fn delete_comment(&mut self, comment: &Comment) {
@@ -2641,7 +2638,14 @@ fn comment_current_range(
         return Some((orig_start, orig_end));
     }
     let map_one = |line: u32| -> Result<Option<u32>, String> {
-        match get_line_mapping(repo, &comment.path, commit_hash, target_sha, line, Side::LEFT) {
+        match get_line_mapping(
+            repo,
+            &comment.path,
+            commit_hash,
+            target_sha,
+            line,
+            Side::LEFT,
+        ) {
             Ok((_, mapped)) => Ok(mapped),
             Err(e) => Err(e),
         }
