@@ -327,58 +327,22 @@ fn update_config_from_remote() -> oxi::Result<()> {
 fn vim_reviewer() -> oxi::Result<()> {
     update_config_from_remote()?;
 
-    api::command("sign define PrReviewComment text=C> texthl=Search linehl=DiffText")?;
+    api::command("highlight default PrReviewCommentSign guifg=#bf5af2 ctermfg=141")?;
+    api::command("sign define PrReviewCommentTop text=╭ texthl=PrReviewCommentSign")?;
+    api::command("sign define PrReviewCommentMid text=│ texthl=PrReviewCommentSign")?;
+    api::command("sign define PrReviewCommentBot text=╰ texthl=PrReviewCommentSign")?;
 
     create_command!(
         "UpdateReviewSigns",
         "Update the gutter symbols for review comments",
         CommandNArgs::ZeroOrOne,
-        |_args: CommandArgs| -> ApiResult<()> {
-            let review = get_current_review();
-            match review {
-                None => Ok(()),
-                Some(review) => {
-                    let mut sign_idx = 0;
-                    api::command("sign unplace * group=PrReviewSigns")?;
-                    let buffers = api::list_bufs();
-                    for buffer in buffers {
-                        unsafe {
-                            let (_side, buffer_path) = get_current_buffer_path()?;
-
-                            let obj: oxi::Object = (&buffer).into();
-                            let handle = obj.as_integer_unchecked();
-
-                            api::out_write(string!("{}\n", buffer_path.display()));
-                            let comments_in_buffer: Vec<&Comment> = review
-                                .comments
-                                .iter()
-                                .filter(|comment| comment.path == buffer_path.to_str().unwrap())
-                                .collect();
-                            for comment in comments_in_buffer {
-                                let start_line = comment.start_line.unwrap_or(comment.line);
-                                let end_line = comment.line;
-                                api::out_write(string!(
-                                    "{:?}: {}-{}\n",
-                                    buffer,
-                                    start_line,
-                                    end_line
-                                ));
-                                for line in start_line..=end_line {
-                                    sign_idx += 1;
-                                    let command = format!(
-                                        "sign place {} line={} name=PrReviewComment group=PrReviewSigns buffer={}",
-                                        sign_idx, line, handle,
-                                    );
-                                    api::command(&command)?;
-                                }
-                            }
-                        }
-                    }
-                    Ok(())
-                }
-            }
-        }
+        |_args: CommandArgs| -> ApiResult<()> { place_review_signs() }
     );
+
+    // Auto-place signs on file load so files opened after `:StartReview` get
+    // gutter markers without a manual `:UpdateReviewSigns`. `place_review_signs`
+    // is a cheap no-op when no review is active.
+    api::command("autocmd BufRead * silent! UpdateReviewSigns")?;
 
     create_command!(
         "StartReview",
@@ -427,6 +391,7 @@ fn vim_reviewer() -> oxi::Result<()> {
                         }
                     }
 
+                    place_review_signs()?;
                     Ok(())
                 }
             }
@@ -466,6 +431,7 @@ fn vim_reviewer() -> oxi::Result<()> {
                                     "Review published successfully to {}\n",
                                     backend_name
                                 ));
+                                clear_review_signs()?;
                             } else {
                                 api::err_writeln(&format!(
                                     "Failed to publish review to {} ({:?}): {:?}",
@@ -889,6 +855,72 @@ fn get_current_review() -> Option<Review> {
         None => None,
         Some(pr_number) => Review::get_review(pr_number),
     }
+}
+
+/// Remove all review-comment signs from all buffers.
+fn clear_review_signs() -> ApiResult<()> {
+    api::command("sign unplace * group=PrReviewSigns")
+}
+
+/// Place bracket-style gutter signs for every comment in the active review,
+/// across all currently loaded working-tree buffers. Existing signs are cleared
+/// first so this is safe to call repeatedly.
+fn place_review_signs() -> ApiResult<()> {
+    clear_review_signs()?;
+    let review = match get_current_review() {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+    let workdir = match Repository::open_from_env()
+        .ok()
+        .and_then(|r| r.workdir().map(|p| p.to_path_buf()))
+    {
+        Some(w) => w,
+        None => return Ok(()),
+    };
+
+    let mut sign_idx = 0u32;
+    for buffer in api::list_bufs() {
+        let buf_path = match buffer.get_name() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if buf_path.starts_with("fugitive://") {
+            continue;
+        }
+        let rel_path = match buf_path
+            .strip_prefix(&workdir)
+            .ok()
+            .and_then(|p| p.to_str())
+        {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let handle = unsafe {
+            let obj: oxi::Object = (&buffer).into();
+            obj.as_integer_unchecked()
+        };
+
+        for comment in review.comments.iter().filter(|c| c.path == rel_path) {
+            let start_line = comment.start_line.unwrap_or(comment.line);
+            let end_line = comment.line;
+            for line in start_line..=end_line {
+                sign_idx += 1;
+                let name = if start_line == end_line || (line != start_line && line != end_line) {
+                    "PrReviewCommentMid"
+                } else if line == start_line {
+                    "PrReviewCommentTop"
+                } else {
+                    "PrReviewCommentBot"
+                };
+                api::command(&format!(
+                    "sign place {} line={} name={} group=PrReviewSigns buffer={}",
+                    sign_idx, line, name, handle
+                ))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Open a new temporary buffer. If `on_save_command` is specified, run the command on BufWritePre
