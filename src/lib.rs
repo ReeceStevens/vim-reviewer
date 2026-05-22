@@ -45,8 +45,17 @@ type ApiResult<T> = std::result::Result<T, api::Error>;
 enum StatusLineAction {
     None,
     OpenFile(String),
-    JumpToComment(String, u32),
-    ToggleComment(usize),
+    JumpToComment {
+        path: String,
+        line: u32,
+        side: Side,
+    },
+    ToggleComment {
+        idx: usize,
+        path: String,
+        line: u32,
+        side: Side,
+    },
 }
 
 thread_local! {
@@ -802,25 +811,9 @@ fn vim_reviewer() -> oxi::Result<()> {
                         );
                     }
                 }
-                Some(StatusLineAction::JumpToComment(path, line)) => {
-                    api::command("wincmd j")?;
-                    api::command(&format!("edit {}", path))?;
-                    let diff_cmd = format!("Gvdiffsplit origin/{}", base_branch);
-                    let _ = api::command(&diff_cmd);
-                    api::command(&format!("{}", line))?;
-                }
-                Some(StatusLineAction::ToggleComment(idx)) => {
-                    EXPANDED_COMMENTS.with(|e| {
-                        let mut set = e.borrow_mut();
-                        if set.contains(&idx) {
-                            set.remove(&idx);
-                        } else {
-                            set.insert(idx);
-                        }
-                    });
-                    let saved_cursor = api::get_current_win().get_cursor()?;
-                    refresh_status_buffer()?;
-                    let _ = api::get_current_win().set_cursor(saved_cursor.0, saved_cursor.1);
+                Some(StatusLineAction::JumpToComment { path, line, side })
+                | Some(StatusLineAction::ToggleComment { path, line, side, .. }) => {
+                    jump_to_comment_in_diff(&path, line, side, base_branch)?;
                 }
                 _ => {}
             }
@@ -841,7 +834,7 @@ fn vim_reviewer() -> oxi::Result<()> {
                 actions.get(line_idx).cloned()
             });
 
-            if let Some(StatusLineAction::ToggleComment(idx)) = action {
+            if let Some(StatusLineAction::ToggleComment { idx, .. }) = action {
                 EXPANDED_COMMENTS.with(|e| {
                     let mut set = e.borrow_mut();
                     if set.contains(&idx) {
@@ -1296,13 +1289,19 @@ fn build_status_lines(
                 // Show full comment body (indented)
                 let header = format!("    [-] {} :", line_display);
                 lines.push(header);
-                actions.push(StatusLineAction::ToggleComment(comment_global_idx));
+                actions.push(StatusLineAction::ToggleComment {
+                    idx: comment_global_idx,
+                    path: fc.path.clone(),
+                    line: comment.line,
+                    side: comment.side,
+                });
                 for body_line in comment.body.lines() {
                     lines.push(format!("         {}", body_line));
-                    actions.push(StatusLineAction::JumpToComment(
-                        fc.path.clone(),
-                        comment.line,
-                    ));
+                    actions.push(StatusLineAction::JumpToComment {
+                        path: fc.path.clone(),
+                        line: comment.line,
+                        side: comment.side,
+                    });
                 }
             } else {
                 // Collapsed: first 50 chars
@@ -1314,7 +1313,12 @@ fn build_status_lines(
                     .replace('\n', " ");
                 let suffix = if comment.body.len() > 50 { "..." } else { "" };
                 lines.push(format!("    [+] {} : {}{}", line_display, preview, suffix));
-                actions.push(StatusLineAction::ToggleComment(comment_global_idx));
+                actions.push(StatusLineAction::ToggleComment {
+                    idx: comment_global_idx,
+                    path: fc.path.clone(),
+                    line: comment.line,
+                    side: comment.side,
+                });
             }
             comment_global_idx += 1;
         }
@@ -1736,6 +1740,50 @@ fn test_current_buffer_path() {
 fn set_text_in_buffer(text: String) -> ApiResult<()> {
     let mut buffer = api::get_current_buf();
     buffer.set_lines(0..10000000, false, text.split("\n"))?;
+    Ok(())
+}
+
+/// Open (or focus the existing) Gvdiffsplit view of `path` and move the cursor to
+/// `line` on the side matching `side`. If a window in the current tab already shows
+/// `path` in diff mode, that window is reused — no extra split is created.
+fn jump_to_comment_in_diff(
+    path: &str,
+    line: u32,
+    side: Side,
+    base_branch: &str,
+) -> ApiResult<()> {
+    let abs_path: String = api::call_function("fnamemodify", (path, ":p"))?;
+    let bufnr: i64 = api::call_function("bufnr", (abs_path,))?;
+    let winid: i64 = if bufnr != -1 {
+        api::call_function("bufwinid", (bufnr,))?
+    } else {
+        -1
+    };
+    let is_diff: i64 = if winid != -1 {
+        api::call_function("getwinvar", (winid, "&diff", 0i64))?
+    } else {
+        0
+    };
+
+    if winid != -1 && is_diff != 0 {
+        // Reuse the existing diff. `bufwinid` returned the working-tree window
+        // (Side::RIGHT); the fugitive revision (Side::LEFT) is one window left.
+        api::call_function::<_, i64>("win_gotoid", (winid,))?;
+        if side == Side::LEFT {
+            api::command("wincmd h")?;
+        }
+    } else {
+        // No diff open for this file — set one up below the status window.
+        api::command("wincmd j")?;
+        api::command(&format!("edit {}", path))?;
+        let diff_cmd = format!("Gvdiffsplit origin/{}", base_branch);
+        let _ = api::command(&diff_cmd);
+        // Gvdiffsplit leaves focus on the LEFT (revision) window.
+        if side == Side::RIGHT {
+            api::command("wincmd l")?;
+        }
+    }
+    api::command(&format!("{}", line))?;
     Ok(())
 }
 
