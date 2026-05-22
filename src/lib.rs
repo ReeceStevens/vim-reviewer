@@ -844,12 +844,11 @@ fn vim_reviewer() -> oxi::Result<()> {
 
             if let Some(StatusLineAction::OpenFile(path)) = action {
                 let config = get_config_from_file();
-                if let Some(pr_number) = config.and_then(|c| c.active_pr) {
-                    if let Some(mut review) = Review::get_review(pr_number) {
+                if let Some(pr_number) = config.and_then(|c| c.active_pr)
+                    && let Some(mut review) = Review::get_review(pr_number) {
                         review.toggle_viewed(&path);
                         review.save();
                     }
-                }
                 let saved_cursor = api::get_current_win().get_cursor()?;
                 refresh_status_buffer()?;
                 let _ = api::get_current_win().set_cursor(saved_cursor.0, saved_cursor.1);
@@ -1238,7 +1237,7 @@ fn build_status_lines(
     let mut comment_global_idx: usize = 0;
 
     for fc in &pr_info.files_changed {
-        let viewed = review.map_or(false, |r| r.viewed_files.contains(&fc.path));
+        let viewed = review.is_some_and(|r| r.viewed_files.contains(&fc.path));
         let checkbox = if viewed { "[x]" } else { "[ ]" };
         let stat_display = format!("+{} -{}", fc.additions, fc.deletions);
         lines.push(format!(
