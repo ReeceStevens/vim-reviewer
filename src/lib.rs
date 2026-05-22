@@ -578,6 +578,191 @@ fn vim_reviewer() -> oxi::Result<()> {
     );
 
     create_command!(
+        "RequestAIReview",
+        "Request an AI-generated code review: RequestAIReview <base_branch>",
+        CommandNArgs::OneOrMore,
+        |args: CommandArgs| -> ApiResult<()> {
+            let raw = args.args.unwrap_or_default();
+            let parts: Vec<&str> = raw.split_whitespace().collect();
+            if parts.is_empty() {
+                api::err_writeln("Usage: RequestAIReview <base_branch>");
+                return Ok(());
+            }
+            let base_branch = parts[0].to_string();
+
+            // Validate the base branch resolves (matches detect_default_branch style).
+            let repo = match Repository::open_from_env() {
+                Ok(r) => r,
+                Err(e) => {
+                    api::err_writeln(&format!("Could not open git repository: {}", e));
+                    return Ok(());
+                }
+            };
+            let resolves = repo
+                .revparse_single(&format!("origin/{}", base_branch))
+                .is_ok()
+                || repo.revparse_single(&base_branch).is_ok();
+            if !resolves {
+                api::err_writeln(&format!(
+                    "Base branch '{}' does not resolve (tried origin/{} and {}).",
+                    base_branch, base_branch, base_branch
+                ));
+                return Ok(());
+            }
+
+            new_temporary_buffer(Some(&format!("RequestAIReviewSubmit {}", base_branch)))?;
+            api::out_write(string!(
+                "Type review context, then :w to submit AI review request.\n"
+            ));
+            Ok(())
+        }
+    );
+
+    create_command!(
+        "RequestAIReviewSubmit",
+        "(internal) Submit the AI review request once the context buffer is written.",
+        CommandNArgs::OneOrMore,
+        |args: CommandArgs| -> ApiResult<()> {
+            let raw = args.args.unwrap_or_default();
+            let parts: Vec<&str> = raw.split_whitespace().collect();
+            if parts.is_empty() {
+                api::err_writeln("RequestAIReviewSubmit: missing base_branch arg.");
+                return Ok(());
+            }
+            let base_branch = parts[0].to_string();
+            let user_context = get_text_from_current_buffer()?;
+            let head_sha = match current_head_sha() {
+                Some(s) => s,
+                None => return Ok(()), // current_head_sha already emits a warning
+            };
+            let pr_number = synthesize_ai_pr_number(&head_sha);
+            let prompt = build_ai_review_prompt(&user_context, &base_branch, &head_sha);
+
+            // Write the prompt to a tempfile so we don't have to wrestle with
+            // command-line escaping for a multi-KB string.
+            let prompt_file = NamedTempFile::new().map_err(|e| {
+                api::Error::Other(format!("Failed to create prompt tempfile: {}", e))
+            })?;
+            let prompt_path = prompt_file.path().to_path_buf();
+            std::fs::write(&prompt_path, prompt.as_bytes()).map_err(|e| {
+                api::Error::Other(format!("Failed to write prompt: {}", e))
+            })?;
+            // Keep the file alive past the closure by leaking the handle;
+            // the Lua side reads it and we clean up after :_LoadAIReview.
+            let _ = prompt_file.keep().map_err(|e| {
+                api::Error::Other(format!("Failed to persist prompt: {}", e))
+            })?;
+
+            let result_file = NamedTempFile::new().map_err(|e| {
+                api::Error::Other(format!("Failed to create result tempfile: {}", e))
+            })?;
+            let result_path = result_file.path().to_path_buf();
+            let _ = result_file.keep().map_err(|e| {
+                api::Error::Other(format!("Failed to persist result file: {}", e))
+            })?;
+
+            // Hand off to Lua for the async claude call + fidget UI.
+            // Do NOT bdelete here — this command runs inside BufWritePre, and
+            // killing the buffer mid-write triggers E203. The user's :w (or
+            // :wq) closes the buffer naturally.
+            let prompt_str = prompt_path.display().to_string();
+            let result_str = result_path.display().to_string();
+            api::command(&format!(
+                "lua require('vim_reviewer_ai').run({{prompt_file='{}', result_file='{}', pr_number={}, base_branch='{}', head_sha='{}'}})",
+                prompt_str, result_str, pr_number, base_branch, head_sha
+            ))?;
+            Ok(())
+        }
+    );
+
+    create_command!(
+        "LoadAIReview",
+        "(internal) Load an AI-generated review from a result file at the given pr_number.",
+        CommandNArgs::OneOrMore,
+        |args: CommandArgs| -> ApiResult<()> {
+            let raw = args.args.unwrap_or_default();
+            let parts: Vec<&str> = raw.split_whitespace().collect();
+            if parts.len() < 2 {
+                api::err_writeln("Usage: LoadAIReview <result_path> <pr_number>");
+                return Ok(());
+            }
+            let result_path = parts[0];
+            let pr_number = match str::parse::<u32>(parts[1]) {
+                Ok(n) => n,
+                Err(_) => {
+                    api::err_writeln("LoadAIReview: invalid pr_number.");
+                    return Ok(());
+                }
+            };
+
+            let raw_json = match std::fs::read_to_string(result_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    api::err_writeln(&format!(
+                        "Failed to read AI review result file {}: {}",
+                        result_path, e
+                    ));
+                    return Ok(());
+                }
+            };
+            let parsed: ParsedAiReview = match serde_json::from_str(&raw_json) {
+                Ok(p) => p,
+                Err(e) => {
+                    api::err_writeln(&format!(
+                        "AI review JSON did not parse: {} (raw output preserved at {}).",
+                        e, result_path
+                    ));
+                    return Ok(());
+                }
+            };
+
+            let mut config = match get_config_from_file() {
+                Some(c) => c,
+                None => {
+                    api::err_writeln("Could not read configuration file.");
+                    return Ok(());
+                }
+            };
+
+            // Backfill commit_hash on any comment that omitted it.
+            let head_sha = current_head_sha();
+            let mut comments = parsed.comments;
+            for c in comments.iter_mut() {
+                if c.commit_hash.is_none() {
+                    c.commit_hash = head_sha.clone();
+                }
+            }
+
+            // Collision handling: archive any prior review at this slot.
+            archive_review_file(pr_number)?;
+
+            let review = Review::new(
+                config.owner.clone(),
+                config.repo.clone(),
+                config.backend.clone(),
+                config.backend_url.clone(),
+                pr_number,
+                parsed.body,
+                comments,
+            );
+            let comment_count = review.comments.len();
+            config.active_pr = Some(pr_number);
+            update_configuration(config);
+            review.save();
+            place_review_signs()?;
+
+            api::out_write(string!(
+                "Loaded AI review with {} comment(s) at PR #{}.\n",
+                comment_count,
+                pr_number
+            ));
+            // Best-effort cleanup of the temp result file.
+            let _ = std::fs::remove_file(result_path);
+            Ok(())
+        }
+    );
+
+    create_command!(
         "ReviewComment",
         "Add a review comment",
         CommandNArgs::ZeroOrOne,
@@ -2221,13 +2406,22 @@ fn jump_to_comment_in_diff(path: &str, line: u32, side: Side, base_branch: &str)
 /// VimL goes through nvim's own version-correct conversion layer.
 fn show_comment_hover(body: &str) -> ApiResult<()> {
     let lines: Vec<&str> = body.split('\n').collect();
-    let height = lines.len().clamp(1, 20) as i64;
     let width = lines
         .iter()
         .map(|l| l.chars().count())
         .max()
         .unwrap_or(1)
         .clamp(20, 80) as i64;
+    // Compute effective height accounting for soft-wrap: long lines occupy
+    // multiple screen rows. Cap at 40 — scroll for anything taller.
+    let wrapped: i64 = lines
+        .iter()
+        .map(|l| {
+            let cols = l.chars().count() as i64;
+            if cols == 0 { 1 } else { (cols + width - 1) / width }
+        })
+        .sum();
+    let height = wrapped.clamp(1, 40);
 
     let mut buf = api::create_buf(false, true)
         .map_err(|_| api::Error::Other("Failed to create hover buffer".to_string()))?;
@@ -2253,15 +2447,26 @@ fn show_comment_hover(body: &str) -> ApiResult<()> {
         ("height", Object::from(height)),
         ("style", Object::from("minimal")),
         ("border", Object::from("rounded")),
-        ("focusable", Object::from(false)),
+        // Focusable so the user can `<C-w>w` into the float and scroll when
+        // the comment is taller than the cap.
+        ("focusable", Object::from(true)),
     ]);
     let win_handle: i64 = api::call_function("nvim_open_win", (buf_handle, false, win_config))?;
 
     let win_scope = Dictionary::from_iter([("win", Object::from(win_handle))]);
     let _: Object = api::call_function("nvim_set_option_value", ("wrap", true, win_scope))?;
 
+    // `q` inside the hover closes it (useful after scrolling).
     api::command(&format!(
-        "autocmd CursorMoved,CursorMovedI,BufLeave,InsertEnter <buffer> ++once lua pcall(vim.api.nvim_win_close, {}, true)",
+        "lua vim.keymap.set('n', 'q', '<cmd>lua pcall(vim.api.nvim_win_close, {}, true)<CR>', {{buffer={}, silent=true, nowait=true}})",
+        win_handle, buf_handle
+    ))?;
+
+    // Auto-dismiss on cursor moves in the origin buffer. `BufLeave` is
+    // intentionally omitted so the user can `<C-w>w` into the float to scroll
+    // without it disappearing.
+    api::command(&format!(
+        "autocmd CursorMoved,CursorMovedI,InsertEnter <buffer> ++once lua pcall(vim.api.nvim_win_close, {}, true)",
         win_handle
     ))?;
 
@@ -3252,6 +3457,89 @@ fn get_review_directory() -> PathBuf {
 
 fn get_review_file_path(pr_number: u32) -> PathBuf {
     get_review_directory().join(Path::new(&format!("{}-review.json", pr_number)))
+}
+
+/// Derive a stable synthetic `pr_number` for AI-generated reviews from the
+/// current HEAD SHA. Takes the first 8 hex characters and parses as a `u32`.
+/// Collisions between different SHAs are vanishingly unlikely; collisions
+/// across re-runs at the same HEAD ARE expected and handled by archiving the
+/// prior review.json before writing.
+fn synthesize_ai_pr_number(head_sha: &str) -> u32 {
+    let prefix: String = head_sha.chars().take(8).collect();
+    u32::from_str_radix(&prefix, 16).unwrap_or(0)
+}
+
+/// Build the prompt sent to the `claude` CLI. The prompt tells Claude to use
+/// its Bash tool to fetch the diff itself, embeds the user's context, and
+/// specifies the exact JSON schema we want back. `commit_hash` is baked into
+/// the schema example so Claude returns the right SHA on each comment.
+fn build_ai_review_prompt(user_context: &str, base_branch: &str, head_sha: &str) -> String {
+    format!(
+        "You are reviewing a code change in a git repository.\n\
+\n\
+USER CONTEXT:\n\
+{user_context}\n\
+\n\
+TASK:\n\
+1. Run `git diff {base_branch}..HEAD --no-color` to see the changes.\n\
+2. For each place you want to leave a comment, use the Read tool on the\n\
+   CURRENT file (not the diff) to LOCATE the exact line number. The Read\n\
+   tool returns each line prefixed with its line number — copy that number\n\
+   verbatim into the `line` field.\n\
+3. Use Read/Grep liberally to understand surrounding context before commenting.\n\
+4. Produce a code review.\n\
+\n\
+LINE NUMBER ACCURACY (critical — do not skip):\n\
+- The `line` field is the line number in the CURRENT file at HEAD, 1-indexed.\n\
+  It is NOT a diff hunk offset, NOT a `position` value, and NOT the\n\
+  line-number-on-the-old-side.\n\
+- BEFORE writing each comment, Read the file at your chosen line (use the\n\
+  `offset` parameter on the Read tool) and confirm the line you see matches\n\
+  the code you want to comment on. If it doesn't match, adjust the line\n\
+  number until it does.\n\
+- `side` is \"RIGHT\" for the new/HEAD file; \"LEFT\" is reserved for comments\n\
+  on lines that were deleted. For commentary on modified or added code\n\
+  (the common case), use \"RIGHT\" and a line number in the new file.\n\
+\n\
+OUTPUT FORMAT:\n\
+Output ONLY a single JSON object matching this schema. No markdown fences,\n\
+no preamble, no commentary outside the JSON.\n\
+\n\
+{{\n\
+  \"body\": \"<string: overall review summary>\",\n\
+  \"comments\": [\n\
+    {{\n\
+      \"body\": \"<string: review comment text>\",\n\
+      \"path\": \"<string: repo-relative file path>\",\n\
+      \"line\": <integer: 1-indexed line in the CURRENT file>,\n\
+      \"side\": \"RIGHT\",\n\
+      \"start_line\": <integer or null: start line for multi-line ranges>,\n\
+      \"start_side\": \"RIGHT\" or null,\n\
+      \"commit_hash\": \"{head_sha}\"\n\
+    }}\n\
+  ]\n\
+}}\n\
+\n\
+RULES:\n\
+- `path` is repo-relative (e.g. \"src/foo.rs\"), NOT absolute.\n\
+- `start_line`/`start_side` are non-null only for multi-line comment ranges.\n\
+- `commit_hash` MUST be exactly: {head_sha}\n\
+- Emit the JSON directly. Do NOT wrap in ```json fences.\n\
+\n\
+BASE BRANCH: {base_branch}\n\
+HEAD SHA: {head_sha}\n\
+\n\
+Produce the review JSON now.\n"
+    )
+}
+
+/// The subset of `Review` we expect Claude to produce: just the overall body
+/// and the inline comments. Everything else (owner/repo/backend/pr_number) is
+/// filled in locally by `:_LoadAIReview`.
+#[derive(Deserialize)]
+struct ParsedAiReview {
+    body: String,
+    comments: Vec<Comment>,
 }
 
 /// Move `<n>-review.json` into `<review-dir>/old-reviews/` with a timestamped
