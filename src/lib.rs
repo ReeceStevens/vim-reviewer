@@ -2832,7 +2832,7 @@ impl Review {
         // intended publish target). If the repo or HEAD can't be resolved, fall
         // back to sending the comments as-stored — at worst this is the pre-
         // commit-hash behavior.
-        let body = match (Repository::open_from_env(), current_head_sha()) {
+        let mut body = match (Repository::open_from_env(), current_head_sha()) {
             (Ok(repo), Some(head_sha)) => {
                 let mut mapped = self.clone();
                 mapped.comments = self.comments_for_publish(&head_sha, &repo);
@@ -2840,6 +2840,16 @@ impl Review {
             }
             _ => serde_json::to_value(self).unwrap_or(serde_json::Value::Null),
         };
+        // `commit_hash` is an internal anchor used for line-mapping; GitHub's
+        // review API rejects unknown fields on individual comments, so strip it
+        // before posting.
+        if let Some(comments) = body.get_mut("comments").and_then(|v| v.as_array_mut()) {
+            for c in comments {
+                if let Some(obj) = c.as_object_mut() {
+                    obj.remove("commit_hash");
+                }
+            }
+        }
         client
             .post(self.post_url())
             .json(&body)
