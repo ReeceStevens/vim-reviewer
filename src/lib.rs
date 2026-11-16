@@ -20,7 +20,7 @@ use sha1::{Digest, Sha1};
 use tempfile::NamedTempFile;
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::File;
 use std::io::prelude::*;
@@ -336,15 +336,27 @@ fn vim_reviewer() -> oxi::Result<()> {
 
     create_command!(
         "UpdateReviewSigns",
-        "Update the gutter symbols for review comments",
+        "Update the gutter symbols for review comments: UpdateReviewSigns [bufnr]",
         CommandNArgs::ZeroOrOne,
-        |_args: CommandArgs| -> ApiResult<()> { place_review_signs() }
+        |args: CommandArgs| -> ApiResult<()> {
+            match args.args.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                None => place_review_signs(),
+                Some(raw) => match raw.parse::<i32>() {
+                    Ok(n) => place_review_signs_in(&[api::Buffer::from(n)]),
+                    Err(_) => {
+                        api::err_writeln(&format!("UpdateReviewSigns: invalid buffer number '{}'", raw));
+                        Ok(())
+                    }
+                },
+            }
+        }
     );
 
     // Auto-place signs on file load so files opened after `:StartReview` get
-    // gutter markers without a manual `:UpdateReviewSigns`. `place_review_signs`
-    // is a cheap no-op when no review is active.
-    api::command("autocmd BufRead,BufWritePost * silent! UpdateReviewSigns")?;
+    // gutter markers without a manual `:UpdateReviewSigns`. Only the buffer
+    // that fired the event is refreshed — refreshing every loaded buffer on
+    // every open made opening files (and the quickfix list) very slow.
+    api::command("autocmd BufRead,BufWritePost * silent! exe 'UpdateReviewSigns' expand('<abuf>')")?;
 
     create_command!(
         "StartReview",
@@ -986,12 +998,13 @@ fn vim_reviewer() -> oxi::Result<()> {
                     Ok(())
                 }
                 Some(review) => {
+                    let mut mapper = WorkdirMapper::new();
                     let comments: Array = review
                         .comments
                         .iter()
                         .filter_map(|comment| {
                             // Skip orphaned comments — they have no anchor at HEAD.
-                            let (_, end) = comment_current_range_in_workdir(comment)?;
+                            let (_, end) = mapper.range(comment)?;
                             Some(Dictionary::from_iter([
                                 ("filename", Object::from(comment.path.clone())),
                                 ("lnum", Object::from(end)),
@@ -1184,21 +1197,37 @@ fn clear_review_signs() -> ApiResult<()> {
 /// across all currently loaded working-tree buffers. Existing signs are cleared
 /// first so this is safe to call repeatedly.
 fn place_review_signs() -> ApiResult<()> {
-    clear_review_signs()?;
+    place_review_signs_in(&api::list_bufs().collect::<Vec<_>>())
+}
+
+/// Like `place_review_signs`, but only (re)places signs in `buffers`; signs in
+/// other buffers are left alone.
+fn place_review_signs_in(buffers: &[api::Buffer]) -> ApiResult<()> {
+    for buffer in buffers {
+        if buffer.is_valid() {
+            api::command(&format!(
+                "sign unplace * group=PrReviewSigns buffer={}",
+                buffer_handle(buffer)
+            ))?;
+        }
+    }
     let review = match get_current_review() {
         Some(r) => r,
         None => return Ok(()),
     };
-    let workdir = match Repository::open_from_env()
-        .ok()
-        .and_then(|r| r.workdir().map(|p| p.to_path_buf()))
-    {
+    if review.comments.is_empty() {
+        return Ok(());
+    }
+    let mut mapper = WorkdirMapper::new();
+    let workdir = match mapper.repo().and_then(|r| r.workdir().map(|p| p.to_path_buf())) {
         Some(w) => w,
         None => return Ok(()),
     };
 
-    let mut sign_idx = 0u32;
-    for buffer in api::list_bufs() {
+    for buffer in buffers {
+        if !buffer.is_valid() {
+            continue;
+        }
         let buf_path = match buffer.get_name() {
             Ok(p) => p,
             Err(_) => continue,
@@ -1214,14 +1243,13 @@ fn place_review_signs() -> ApiResult<()> {
             Some(s) => s.to_string(),
             None => continue,
         };
-        let handle = unsafe {
-            let obj: oxi::Object = (&buffer).into();
-            obj.as_integer_unchecked()
-        };
+        let handle = buffer_handle(buffer);
 
+        // Sign ids only need to be unique within a buffer.
+        let mut sign_idx = 0u32;
         for comment in review.comments.iter().filter(|c| c.path == rel_path) {
             // Skip orphaned comments (anchor line was deleted between commit_hash and HEAD).
-            let (start_line, end_line) = match comment_current_range_in_workdir(comment) {
+            let (start_line, end_line) = match mapper.range(comment) {
                 Some(r) => r,
                 None => continue,
             };
@@ -1242,6 +1270,13 @@ fn place_review_signs() -> ApiResult<()> {
         }
     }
     Ok(())
+}
+
+fn buffer_handle(buffer: &api::Buffer) -> i64 {
+    unsafe {
+        let obj: oxi::Object = buffer.into();
+        obj.as_integer_unchecked()
+    }
 }
 
 /// Open a new temporary buffer. If `on_save_command` is specified, run the command on BufWritePre
@@ -1840,6 +1875,7 @@ fn build_status_lines(
 ) -> (Vec<String>, Vec<StatusLineAction>) {
     let mut lines: Vec<String> = Vec::new();
     let mut actions: Vec<StatusLineAction> = Vec::new();
+    let mut mapper = WorkdirMapper::new();
 
     // Header
     let title_str = match &pr_info.title {
@@ -1914,7 +1950,7 @@ fn build_status_lines(
             .collect();
 
         for (_review_comment_idx, comment) in &file_comments {
-            let mapped = comment_current_range_in_workdir(comment);
+            let mapped = mapper.range(comment);
             let orphaned = mapped.is_none();
             let orig_start = comment.start_line.unwrap_or(comment.line);
             let orig_end = comment.line;
@@ -3176,11 +3212,12 @@ impl Review {
         // Match the cursor line (which is at working-tree HEAD) against each
         // comment's range mapped from its `commit_hash` to HEAD. Orphaned
         // comments (anchor line was deleted) never match.
+        let mut mapper = WorkdirMapper::new();
         self.comments.iter().enumerate().find(|(_idx, comment)| {
             if comment.path != path {
                 return false;
             }
-            match comment_current_range_in_workdir(comment) {
+            match mapper.range(comment) {
                 Some((start, end)) => start <= line && line <= end,
                 None => false,
             }
@@ -3251,16 +3288,13 @@ fn line_mapping_diff_opts(file_path: &str) -> git2::DiffOptions {
     diff_opts
 }
 
-/// Walk a built `Diff` and translate `line_number` (on `side`) to the
-/// corresponding line on the other side. Shared by both the tree-to-tree
-/// (`get_line_mapping`) and tree-to-workdir (`get_line_mapping_to_workdir`)
-/// flavors.
-fn extract_line_mapping_from_diff(
-    diff: &git2::Diff<'_>,
-    file_path: &str,
-    line_number: u32,
-    side: Side,
-) -> Result<(Option<u32>, Option<u32>), String> {
+/// Every emitted line of one file's diff as `(old_lineno, new_lineno)` pairs;
+/// either side is `None` for added/deleted lines.
+type LineMap = Vec<(Option<u32>, Option<u32>)>;
+
+/// Walk a built `Diff` and collect the line pairs for `file_path`. Shared by
+/// the tree-to-tree and tree-to-workdir flavors.
+fn build_line_map(diff: &git2::Diff<'_>, file_path: &str) -> Result<LineMap, String> {
     let file_path = to_git_path(file_path);
     let path_matches = |f: git2::DiffFile<'_>| {
         f.path()
@@ -3268,7 +3302,7 @@ fn extract_line_mapping_from_diff(
             .map(|s| s == file_path)
             .unwrap_or(false)
     };
-    let mut line_map: Vec<(Option<u32>, Option<u32>)> = Vec::new();
+    let mut line_map: LineMap = Vec::new();
     // NOTE: returning `false` from a git2 `foreach` callback ABORTS the whole
     // walk with GIT_EUSER (-7) — it does not mean "skip this file". So every
     // callback returns `true` and filtering happens per line instead.
@@ -3290,22 +3324,20 @@ fn extract_line_mapping_from_diff(
         }),
     )
     .map_err(|e| format!("Failed to process diff: {}", e))?;
+    Ok(line_map)
+}
 
-    for (old_line, new_line) in &line_map {
-        if side == Side::LEFT {
-            if let Some(old) = old_line
-                && *old == line_number
-            {
-                return Ok((*old_line, *new_line));
-            }
-        } else if let Some(new) = new_line
-            && *new == line_number
-        {
-            return Ok((*old_line, *new_line));
-        }
-    }
-    // Not found in diff → line is unchanged.
-    Ok((Some(line_number), Some(line_number)))
+/// Translate `line_number` (on `side`) through a `LineMap`.
+fn lookup_line(line_map: &LineMap, line_number: u32, side: Side) -> (Option<u32>, Option<u32>) {
+    line_map
+        .iter()
+        .find(|(old, new)| {
+            let probe = if side == Side::LEFT { old } else { new };
+            *probe == Some(line_number)
+        })
+        .copied()
+        // Not found in diff → line is unchanged.
+        .unwrap_or((Some(line_number), Some(line_number)))
 }
 
 /// Get the old and new line numbers for a given line in a diff between two
@@ -3338,19 +3370,13 @@ fn get_line_mapping(
     let diff = repo
         .diff_tree_to_tree(Some(&base_tree), Some(&head_tree), Some(&mut diff_opts))
         .map_err(|e| format!("Failed to create diff: {}", e))?;
-    extract_line_mapping_from_diff(&diff, file_path, line_number, side)
+    Ok(lookup_line(&build_line_map(&diff, file_path)?, line_number, side))
 }
 
-/// Like `get_line_mapping`, but the "new" side is the current working tree
-/// (including uncommitted changes) rather than another committed tree.
-/// Use this for local UI mapping (gutter signs, hover lookup, etc.).
-fn get_line_mapping_to_workdir(
-    repo: &Repository,
-    file_path: &str,
-    base_sha: &str,
-    line_number: u32,
-    side: Side,
-) -> Result<(Option<u32>, Option<u32>), String> {
+/// Build the `LineMap` for `file_path` between `base_sha` and the current
+/// working tree (including uncommitted changes) rather than another committed
+/// tree. Used for local UI mapping via `WorkdirMapper`.
+fn workdir_line_map(repo: &Repository, file_path: &str, base_sha: &str) -> Result<LineMap, String> {
     let base_oid = git2::Oid::from_str(base_sha).map_err(|e| format!("Invalid base SHA: {}", e))?;
     let base_commit = repo
         .find_commit(base_oid)
@@ -3362,7 +3388,7 @@ fn get_line_mapping_to_workdir(
     let diff = repo
         .diff_tree_to_workdir(Some(&base_tree), Some(&mut diff_opts))
         .map_err(|e| format!("Failed to create diff: {}", e))?;
-    extract_line_mapping_from_diff(&diff, file_path, line_number, side)
+    build_line_map(&diff, file_path)
 }
 
 /// Resolve the current HEAD's commit SHA, or `None` if outside a repo / no HEAD.
@@ -3460,81 +3486,99 @@ fn comment_current_range(
     Some((start_mapped.min(end_mapped), start_mapped.max(end_mapped)))
 }
 
-/// Convenience: map relative to current local HEAD. Opens its own `Repository`.
-/// Map a comment from its stored `commit_hash` to where it lives in the
-/// current working tree (including uncommitted edits). This is the function
-/// used by every local-UI surface (gutter signs, hover lookup, status buffer,
-/// quickfix, jump-to-comment).
+/// Maps comments from their stored `commit_hash` to where they live in the
+/// current working tree (including uncommitted edits). This is what every
+/// local-UI surface uses (gutter signs, hover lookup, status buffer, quickfix,
+/// jump-to-comment).
 ///
-/// Returns:
-/// - `Some((start, end))` mapped to the working-tree line numbers, OR original
-///   range when no remapping is needed / possible (LEFT-side comment, no
-///   `commit_hash`, or git2 fails — graceful fallback so comments stay visible).
-/// - `None` when an anchor line was deleted between `commit_hash` and the
-///   working tree (orphaned).
-fn comment_current_range_in_workdir(comment: &Comment) -> Option<(u32, u32)> {
-    let orig_start = comment.start_line.unwrap_or(comment.line);
-    let orig_end = comment.line;
-    if comment.side == Side::LEFT {
-        return Some((orig_start, orig_end));
+/// Working-tree diffs are expensive (especially on Windows, where stat calls
+/// and CRLF filtering are slow), so one mapper opens the repository once —
+/// lazily, on first use — and builds at most one diff per `(path, commit)`
+/// pair. Create one per operation and reuse it across all comments; don't keep
+/// it across operations, since the working tree changes underneath it.
+struct WorkdirMapper {
+    /// `None` = not opened yet; `Some(None)` = opening failed (already reported).
+    repo: Option<Option<Repository>>,
+    /// `None` value = building the map failed (already reported).
+    cache: HashMap<(String, String), Option<LineMap>>,
+}
+
+impl WorkdirMapper {
+    fn new() -> Self {
+        WorkdirMapper {
+            repo: None,
+            cache: HashMap::new(),
+        }
     }
-    let commit_hash = match &comment.commit_hash {
-        Some(h) => h.clone(),
-        None => return Some((orig_start, orig_end)),
-    };
-    let repo = match Repository::open_from_env() {
-        Ok(r) => r,
-        Err(e) => {
-            api::err_writeln(&format!(
-                "[vim-reviewer] mapping {}: failed to open repo: {} \u{2014} using stored line.",
-                comment.path, e
-            ));
-            return Some((orig_start, orig_end));
+
+    fn repo(&mut self) -> Option<&Repository> {
+        self.repo
+            .get_or_insert_with(|| match Repository::open_from_env() {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    api::err_writeln(&format!(
+                        "[vim-reviewer] failed to open repo: {} \u{2014} using stored lines.",
+                        e
+                    ));
+                    None
+                }
+            })
+            .as_ref()
+    }
+
+    /// Returns:
+    /// - `Some((start, end))` mapped to working-tree line numbers, OR the
+    ///   original range when no remapping is needed / possible (LEFT-side
+    ///   comment, no `commit_hash`, or git2 fails — graceful fallback so
+    ///   comments stay visible).
+    /// - `None` when an anchor line was deleted between `commit_hash` and the
+    ///   working tree (orphaned).
+    fn range(&mut self, comment: &Comment) -> Option<(u32, u32)> {
+        let orig_start = comment.start_line.unwrap_or(comment.line);
+        let orig_end = comment.line;
+        let orig = Some((orig_start, orig_end));
+        if comment.side == Side::LEFT {
+            return orig;
         }
-    };
-    let map_one = |line: u32| -> Result<Option<u32>, String> {
-        match get_line_mapping_to_workdir(&repo, &comment.path, &commit_hash, line, Side::LEFT) {
-            Ok((_, mapped)) => Ok(mapped),
-            Err(e) => Err(e),
+        let commit_hash = match &comment.commit_hash {
+            Some(h) => h,
+            None => return orig,
+        };
+        let key = (comment.path.clone(), commit_hash.clone());
+        if !self.cache.contains_key(&key) {
+            let map = match self.repo() {
+                None => None,
+                Some(repo) => match workdir_line_map(repo, &comment.path, commit_hash) {
+                    Ok(m) => Some(m),
+                    Err(e) => {
+                        api::err_writeln(&format!(
+                            "[vim-reviewer] line mapping failed for {} (from {}): {} \u{2014} using stored lines.",
+                            comment.path, commit_hash, e
+                        ));
+                        None
+                    }
+                },
+            };
+            self.cache.insert(key.clone(), map);
         }
-    };
-    let start_mapped = match map_one(orig_start) {
-        Ok(Some(n)) => n,
-        Ok(None) => return None,
-        Err(e) => {
-            api::err_writeln(&format!(
-                "[vim-reviewer] line mapping failed for {} L{} (from {}): {} \u{2014} using stored line.",
-                comment.path, orig_start, commit_hash, e
-            ));
-            return Some((orig_start, orig_end));
-        }
-    };
-    let end_mapped = if orig_end == orig_start {
-        start_mapped
-    } else {
-        match map_one(orig_end) {
-            Ok(Some(n)) => n,
-            Ok(None) => return None,
-            Err(e) => {
-                api::err_writeln(&format!(
-                    "[vim-reviewer] line mapping failed for {} L{} (from {}): {} \u{2014} using stored line.",
-                    comment.path, orig_end, commit_hash, e
-                ));
-                return Some((orig_start, orig_end));
-            }
-        }
-    };
-    Some((start_mapped.min(end_mapped), start_mapped.max(end_mapped)))
+        let map = match &self.cache[&key] {
+            Some(m) => m,
+            None => return orig,
+        };
+        let start = lookup_line(map, orig_start, Side::LEFT).1?;
+        let end = lookup_line(map, orig_end, Side::LEFT).1?;
+        Some((start.min(end), start.max(end)))
+    }
 }
 
 fn get_review_directory() -> PathBuf {
-    let output = Command::new("git")
-        .arg("rev-parse")
-        .arg("--git-dir")
-        .output()
-        .expect("git command failed");
-    let git_output = String::from_utf8(output.stdout).unwrap();
-    let git_dir = Path::new(git_output.trim());
+    // Resolve the git dir in-process via libgit2 rather than spawning
+    // `git rev-parse --git-dir`: this runs on every buffer open, and process
+    // spawns are very slow on Windows. If discovery fails, fall back to a
+    // relative `reviews/` dir, matching the old empty-output behavior.
+    let git_dir = Repository::open_from_env()
+        .map(|r| r.path().to_path_buf())
+        .unwrap_or_default();
     let review_dir = git_dir.join(Path::new("reviews"));
     std::fs::create_dir_all(&review_dir).unwrap();
     review_dir
@@ -3752,8 +3796,42 @@ mod line_mapping_tests {
             assert_eq!(mapped, (Some(3), Some(4)), "path {path}");
         }
         // Workdir flavor (clean tree == head).
-        let mapped =
-            get_line_mapping_to_workdir(&repo, "Common\\dicom\\main.cpp", &b, 1, Side::LEFT).unwrap();
-        assert_eq!(mapped, (Some(1), Some(2)));
+        let map = workdir_line_map(&repo, "Common\\dicom\\main.cpp", &b).unwrap();
+        assert_eq!(lookup_line(&map, 1, Side::LEFT), (Some(1), Some(2)));
+    }
+}
+
+#[cfg(test)]
+mod workdir_mapper_tests {
+    use super::*;
+
+    /// One mapper builds one diff per (path, commit) and reuses it for every
+    /// comment endpoint; orphaned (deleted) anchors map to `None`.
+    #[test]
+    fn mapper_caches_per_file_and_maps_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let workdir = repo.workdir().unwrap().to_path_buf();
+        std::fs::write(workdir.join("f.txt"), "a\nb\nc\nd\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("f.txt")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("t", "t@example.com").unwrap();
+        let base = repo.commit(Some("HEAD"), &sig, &sig, "c", &tree, &[]).unwrap().to_string();
+        // Uncommitted edit: insert a line at the top, delete "c".
+        std::fs::write(workdir.join("f.txt"), "new\na\nb\nd\n").unwrap();
+
+        let mk = |start: Option<u32>, line: u32| {
+            Comment::new("x".into(), line, "f.txt".into(), Side::RIGHT, start, None, Some(base.clone()))
+        };
+        let mut mapper = WorkdirMapper {
+            repo: Some(Some(Repository::open(dir.path()).unwrap())),
+            cache: HashMap::new(),
+        };
+        assert_eq!(mapper.range(&mk(Some(1), 2)), Some((2, 3)));
+        assert_eq!(mapper.range(&mk(None, 4)), Some((4, 4)));
+        assert_eq!(mapper.range(&mk(None, 3)), None); // "c" was deleted
+        assert_eq!(mapper.cache.len(), 1);
     }
 }
