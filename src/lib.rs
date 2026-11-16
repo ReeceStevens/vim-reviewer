@@ -2797,6 +2797,7 @@ impl Review {
             .filter_map(|c| match comment_current_range(c, target_sha, repo) {
                 Some((start, end)) => {
                     let mut mapped = c.clone();
+                    mapped.path = to_git_path(&c.path);
                     mapped.line = end;
                     // Preserve start_line's Some/None shape (multi-line vs single).
                     mapped.start_line = c.start_line.map(|_| start);
@@ -3232,6 +3233,24 @@ impl Review {
     }
 }
 
+/// git2 always reports repo-relative paths with `/` separators, but on
+/// Windows comment paths are built from native paths (`a\\b\\c.cpp`).
+/// Normalize to git's form before comparing against or sending to git/forges.
+fn to_git_path(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+/// Diff options shared by the line-mapping helpers: full-file context (so every
+/// line is emitted) and a literal pathspec limiting the diff to one file.
+fn line_mapping_diff_opts(file_path: &str) -> git2::DiffOptions {
+    let mut diff_opts = git2::DiffOptions::new();
+    diff_opts
+        .context_lines(u32::MAX / 2)
+        .pathspec(to_git_path(file_path))
+        .disable_pathspec_match(true);
+    diff_opts
+}
+
 /// Walk a built `Diff` and translate `line_number` (on `side`) to the
 /// corresponding line on the other side. Shared by both the tree-to-tree
 /// (`get_line_mapping`) and tree-to-workdir (`get_line_mapping_to_workdir`)
@@ -3242,20 +3261,25 @@ fn extract_line_mapping_from_diff(
     line_number: u32,
     side: Side,
 ) -> Result<(Option<u32>, Option<u32>), String> {
+    let file_path = to_git_path(file_path);
+    let path_matches = |f: git2::DiffFile<'_>| {
+        f.path()
+            .and_then(|p| p.to_str())
+            .map(|s| s == file_path)
+            .unwrap_or(false)
+    };
     let mut line_map: Vec<(Option<u32>, Option<u32>)> = Vec::new();
+    // NOTE: returning `false` from a git2 `foreach` callback ABORTS the whole
+    // walk with GIT_EUSER (-7) — it does not mean "skip this file". So every
+    // callback returns `true` and filtering happens per line instead.
     diff.foreach(
-        &mut |delta, _progress| {
-            let path_matches = |f: git2::DiffFile<'_>| {
-                f.path()
-                    .and_then(|p| p.to_str())
-                    .map(|s| s == file_path)
-                    .unwrap_or(false)
-            };
-            path_matches(delta.new_file()) || path_matches(delta.old_file())
-        },
+        &mut |_delta, _progress| true,
         None,
         None,
-        Some(&mut |_delta, _hunk, line| {
+        Some(&mut |delta, _hunk, line| {
+            if !(path_matches(delta.new_file()) || path_matches(delta.old_file())) {
+                return true;
+            }
             match line.origin() {
                 ' ' => line_map.push((line.old_lineno(), line.new_lineno())),
                 '-' => line_map.push((line.old_lineno(), None)),
@@ -3310,10 +3334,7 @@ fn get_line_mapping(
         .tree()
         .map_err(|e| format!("Failed to get head tree: {}", e))?;
 
-    // Effectively-infinite context so every line of the file is emitted —
-    // see `extract_line_mapping_from_diff`.
-    let mut diff_opts = git2::DiffOptions::new();
-    diff_opts.context_lines(u32::MAX / 2);
+    let mut diff_opts = line_mapping_diff_opts(file_path);
     let diff = repo
         .diff_tree_to_tree(Some(&base_tree), Some(&head_tree), Some(&mut diff_opts))
         .map_err(|e| format!("Failed to create diff: {}", e))?;
@@ -3337,8 +3358,7 @@ fn get_line_mapping_to_workdir(
     let base_tree = base_commit
         .tree()
         .map_err(|e| format!("Failed to get base tree: {}", e))?;
-    let mut diff_opts = git2::DiffOptions::new();
-    diff_opts.context_lines(u32::MAX / 2);
+    let mut diff_opts = line_mapping_diff_opts(file_path);
     let diff = repo
         .diff_tree_to_workdir(Some(&base_tree), Some(&mut diff_opts))
         .map_err(|e| format!("Failed to create diff: {}", e))?;
@@ -3686,4 +3706,54 @@ pub fn update_configuration(config: Config) {
     };
     file.write_all(serde_json::to_string(&config).unwrap().as_bytes())
         .unwrap();
+}
+
+#[cfg(test)]
+mod line_mapping_tests {
+    use super::*;
+
+    fn commit_files(repo: &Repository, files: &[(&str, &str)], parent: Option<git2::Oid>) -> git2::Oid {
+        let workdir = repo.workdir().unwrap();
+        let mut index = repo.index().unwrap();
+        for (path, content) in files {
+            let full = workdir.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(&full, content).unwrap();
+            index.add_path(Path::new(path)).unwrap();
+        }
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("t", "t@example.com").unwrap();
+        let parents: Vec<git2::Commit> = parent.into_iter().map(|p| repo.find_commit(p).unwrap()).collect();
+        let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
+        repo.commit(Some("HEAD"), &sig, &sig, "c", &tree, &parent_refs).unwrap()
+    }
+
+    /// Regression: mapping a line in a file that is NOT the first delta of the
+    /// diff used to abort with GIT_EUSER (-7), and Windows-style paths never
+    /// matched git2's `/`-separated paths.
+    #[test]
+    fn maps_lines_in_non_first_file_and_backslash_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let base = commit_files(
+            &repo,
+            &[("a.txt", "1\n2\n3\n"), ("Common/dicom/main.cpp", "a\nb\nc\nd\n")],
+            None,
+        );
+        let head = commit_files(
+            &repo,
+            &[("a.txt", "0\n1\n2\n3\n"), ("Common/dicom/main.cpp", "new\na\nb\nc\nd\n")],
+            Some(base),
+        );
+        let (b, h) = (base.to_string(), head.to_string());
+        for path in ["Common/dicom/main.cpp", "Common\\dicom\\main.cpp"] {
+            let mapped = get_line_mapping(&repo, path, &b, &h, 3, Side::LEFT).unwrap();
+            assert_eq!(mapped, (Some(3), Some(4)), "path {path}");
+        }
+        // Workdir flavor (clean tree == head).
+        let mapped =
+            get_line_mapping_to_workdir(&repo, "Common\\dicom\\main.cpp", &b, 1, Side::LEFT).unwrap();
+        assert_eq!(mapped, (Some(1), Some(2)));
+    }
 }
