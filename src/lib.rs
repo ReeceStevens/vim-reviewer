@@ -339,12 +339,20 @@ fn vim_reviewer() -> oxi::Result<()> {
         "Update the gutter symbols for review comments: UpdateReviewSigns [bufnr]",
         CommandNArgs::ZeroOrOne,
         |args: CommandArgs| -> ApiResult<()> {
-            match args.args.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            match args
+                .args
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
                 None => place_review_signs(),
                 Some(raw) => match raw.parse::<i32>() {
                     Ok(n) => place_review_signs_in(&[api::Buffer::from(n)]),
                     Err(_) => {
-                        api::err_writeln(&format!("UpdateReviewSigns: invalid buffer number '{}'", raw));
+                        api::err_writeln(&format!(
+                            "UpdateReviewSigns: invalid buffer number '{}'",
+                            raw
+                        ));
                         Ok(())
                     }
                 },
@@ -356,7 +364,9 @@ fn vim_reviewer() -> oxi::Result<()> {
     // gutter markers without a manual `:UpdateReviewSigns`. Only the buffer
     // that fired the event is refreshed — refreshing every loaded buffer on
     // every open made opening files (and the quickfix list) very slow.
-    api::command("autocmd BufRead,BufWritePost * silent! exe 'UpdateReviewSigns' expand('<abuf>')")?;
+    api::command(
+        "autocmd BufRead,BufWritePost * silent! exe 'UpdateReviewSigns' expand('<abuf>')",
+    )?;
 
     create_command!(
         "StartReview",
@@ -1219,7 +1229,10 @@ fn place_review_signs_in(buffers: &[api::Buffer]) -> ApiResult<()> {
         return Ok(());
     }
     let mut mapper = WorkdirMapper::new();
-    let workdir = match mapper.repo().and_then(|r| r.workdir().map(|p| p.to_path_buf())) {
+    let workdir = match mapper
+        .repo()
+        .and_then(|r| r.workdir().map(|p| p.to_path_buf()))
+    {
         Some(w) => w,
         None => return Ok(()),
     };
@@ -3370,7 +3383,11 @@ fn get_line_mapping(
     let diff = repo
         .diff_tree_to_tree(Some(&base_tree), Some(&head_tree), Some(&mut diff_opts))
         .map_err(|e| format!("Failed to create diff: {}", e))?;
-    Ok(lookup_line(&build_line_map(&diff, file_path)?, line_number, side))
+    Ok(lookup_line(
+        &build_line_map(&diff, file_path)?,
+        line_number,
+        side,
+    ))
 }
 
 /// Build the `LineMap` for `file_path` between `base_sha` and the current
@@ -3756,7 +3773,11 @@ pub fn update_configuration(config: Config) {
 mod line_mapping_tests {
     use super::*;
 
-    fn commit_files(repo: &Repository, files: &[(&str, &str)], parent: Option<git2::Oid>) -> git2::Oid {
+    fn commit_files(
+        repo: &Repository,
+        files: &[(&str, &str)],
+        parent: Option<git2::Oid>,
+    ) -> git2::Oid {
         let workdir = repo.workdir().unwrap();
         let mut index = repo.index().unwrap();
         for (path, content) in files {
@@ -3768,9 +3789,13 @@ mod line_mapping_tests {
         index.write().unwrap();
         let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
         let sig = git2::Signature::now("t", "t@example.com").unwrap();
-        let parents: Vec<git2::Commit> = parent.into_iter().map(|p| repo.find_commit(p).unwrap()).collect();
+        let parents: Vec<git2::Commit> = parent
+            .into_iter()
+            .map(|p| repo.find_commit(p).unwrap())
+            .collect();
         let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
-        repo.commit(Some("HEAD"), &sig, &sig, "c", &tree, &parent_refs).unwrap()
+        repo.commit(Some("HEAD"), &sig, &sig, "c", &tree, &parent_refs)
+            .unwrap()
     }
 
     /// Regression: mapping a line in a file that is NOT the first delta of the
@@ -3782,12 +3807,18 @@ mod line_mapping_tests {
         let repo = Repository::init(dir.path()).unwrap();
         let base = commit_files(
             &repo,
-            &[("a.txt", "1\n2\n3\n"), ("Common/dicom/main.cpp", "a\nb\nc\nd\n")],
+            &[
+                ("a.txt", "1\n2\n3\n"),
+                ("Common/dicom/main.cpp", "a\nb\nc\nd\n"),
+            ],
             None,
         );
         let head = commit_files(
             &repo,
-            &[("a.txt", "0\n1\n2\n3\n"), ("Common/dicom/main.cpp", "new\na\nb\nc\nd\n")],
+            &[
+                ("a.txt", "0\n1\n2\n3\n"),
+                ("Common/dicom/main.cpp", "new\na\nb\nc\nd\n"),
+            ],
             Some(base),
         );
         let (b, h) = (base.to_string(), head.to_string());
@@ -3818,12 +3849,23 @@ mod workdir_mapper_tests {
         index.write().unwrap();
         let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
         let sig = git2::Signature::now("t", "t@example.com").unwrap();
-        let base = repo.commit(Some("HEAD"), &sig, &sig, "c", &tree, &[]).unwrap().to_string();
+        let base = repo
+            .commit(Some("HEAD"), &sig, &sig, "c", &tree, &[])
+            .unwrap()
+            .to_string();
         // Uncommitted edit: insert a line at the top, delete "c".
         std::fs::write(workdir.join("f.txt"), "new\na\nb\nd\n").unwrap();
 
         let mk = |start: Option<u32>, line: u32| {
-            Comment::new("x".into(), line, "f.txt".into(), Side::RIGHT, start, None, Some(base.clone()))
+            Comment::new(
+                "x".into(),
+                line,
+                "f.txt".into(),
+                Side::RIGHT,
+                start,
+                None,
+                Some(base.clone()),
+            )
         };
         let mut mapper = WorkdirMapper {
             repo: Some(Some(Repository::open(dir.path()).unwrap())),
