@@ -9,9 +9,18 @@ case "$profile" in
     *) echo "Usage: ./build [debug|release]"; exit 1 ;;
 esac
 
+# Install the library as a NEW file (copy to a temp name, then rename over the
+# old one) instead of `cp`-ing over it in place. Overwriting a loaded/signed
+# library in place makes macOS's kernel reject its cached code signature and
+# SIGKILL any process that loads it; on Linux it can corrupt running nvims.
+install_lib() {
+    cp "$1" "$2.tmp.$$"
+    mv -f "$2.tmp.$$" "$2"
+}
+
 case "$(uname -s)" in
-    Linux*)               cp "./target/$profile/libvim_reviewer.so"    ./lua/vim_reviewer.so  ;;
-    Darwin*)              cp "./target/$profile/libvim_reviewer.dylib" ./lua/vim_reviewer.so  ;;
-    MINGW*|MSYS*|CYGWIN*) cp "./target/$profile/vim_reviewer.dll"     ./lua/vim_reviewer.dll ;;
+    Linux*)               install_lib "./target/$profile/libvim_reviewer.so"    ./lua/vim_reviewer.so  ;;
+    Darwin*)              install_lib "./target/$profile/libvim_reviewer.dylib" ./lua/vim_reviewer.so  ;;
+    MINGW*|MSYS*|CYGWIN*) install_lib "./target/$profile/vim_reviewer.dll"     ./lua/vim_reviewer.dll ;;
     *) echo "Unsupported platform: $(uname -s)"; exit 1 ;;
 esac
