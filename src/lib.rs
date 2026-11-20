@@ -532,6 +532,17 @@ fn vim_reviewer() -> oxi::Result<()> {
                         }
                     };
 
+                    // GitHub rejects the whole review if any one comment is
+                    // misplaced and doesn't say which, so check first.
+                    if review.backend == GitBackend::GitHub
+                        && !check_github_placement(&review, &token)
+                    {
+                        api::err_writeln(
+                            "Not publishing. Move or delete the comments listed above, then try again.",
+                        );
+                        return Ok(());
+                    }
+
                     match review.publish(token) {
                         Ok(response) => {
                             let status = response.status();
@@ -564,6 +575,36 @@ fn vim_reviewer() -> oxi::Result<()> {
                     api::err_writeln("Cannot publish since no review is currently active.");
                 }
             };
+            Ok(())
+        }
+    );
+
+    create_command!(
+        "ReviewValidate",
+        "Check that every comment sits on a line GitHub will accept",
+        CommandNArgs::ZeroOrOne,
+        |_args: CommandArgs| -> ApiResult<()> {
+            let Some(review) = get_current_review() else {
+                api::err_writeln("No review is currently active.");
+                return Ok(());
+            };
+            if review.backend != GitBackend::GitHub {
+                api::err_writeln("ReviewValidate only supports GitHub reviews.");
+                return Ok(());
+            }
+            let token = match env::var("GH_REVIEW_API_TOKEN") {
+                Ok(t) => t,
+                Err(e) => {
+                    api::err_writeln(&format!("GH_REVIEW_API_TOKEN not set: {}", e));
+                    return Ok(());
+                }
+            };
+            if check_github_placement(&review, &token) {
+                api::out_write(string!(
+                    "All {} comment(s) are on valid diff lines.\n",
+                    review.comments.len()
+                ));
+            }
             Ok(())
         }
     );
@@ -796,19 +837,48 @@ fn vim_reviewer() -> oxi::Result<()> {
                         return Ok(());
                     }
                     let (side, path) = get_current_buffer_path()?;
-                    let multi_line = args.line1 != args.line2;
+                    let path_str = path.to_str().unwrap().to_string();
                     let commit_hash = current_head_sha();
+                    let (mut start, mut end) = (args.line1 as u32, args.line2 as u32);
+                    // The cursor is on a working-tree line, but the comment is
+                    // anchored at HEAD. Translate so uncommitted edits above
+                    // the cursor don't shift the comment.
+                    if side == Side::RIGHT
+                        && let Some(head) = &commit_hash
+                        && let Ok(repo) = Repository::open_from_env()
+                    {
+                        match workdir_line_map(&repo, &path_str, head) {
+                            Ok(map) => {
+                                let to_head = |l: u32| lookup_line(&map, l, Side::RIGHT).0;
+                                match (to_head(start), to_head(end)) {
+                                    (Some(s), Some(e)) => (start, end) = (s.min(e), s.max(e)),
+                                    _ => {
+                                        api::err_writeln(&format!(
+                                            "Line(s) {}-{} include uncommitted changes that don't exist at HEAD ({}), \
+                                             so GitHub can't anchor a comment there. Put the range on committed lines \
+                                             (or stash your local edits).",
+                                            start,
+                                            end,
+                                            &head[..8]
+                                        ));
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                            Err(e) => warn(&format!(
+                                "[vim-reviewer] couldn't map working-tree line to HEAD ({}); using cursor line.",
+                                e
+                            )),
+                        }
+                    }
+                    let multi_line = start != end;
                     review.in_progress_comment = Some(Comment::new(
                         "".to_string(),
-                        args.line2 as u32,
-                        path.to_str().unwrap().to_string(),
+                        end,
+                        path_str,
                         side,
-                        Some(if multi_line {
-                            args.line1 as u32
-                        } else {
-                            (args.line1 - 1) as u32
-                        }),
-                        Some(side),
+                        multi_line.then_some(start),
+                        multi_line.then_some(side),
                         commit_hash,
                     ));
                     review.save();
@@ -1670,9 +1740,10 @@ fn fetch_review_github(config: &Config, pr_number: u32, token: &str) -> Option<R
         })
         .unwrap_or(false);
     let patches = if needs_patches {
-        fetch_github_pr_patches(&client, &headers, config, pr_number)
+        fetch_github_pr_patches(&client, &headers, &config.owner, &config.repo, pr_number)
+            .unwrap_or_default()
     } else {
-        std::collections::HashMap::new()
+        HashMap::new()
     };
 
     let comments: Vec<Comment> = raw_array
@@ -2687,38 +2758,188 @@ fn parse_patch_position(patch: &str, position: u32) -> Option<(u32, Side)> {
     None
 }
 
-/// Fetch the per-file patches for a GitHub PR. Returns `path → patch` so
-/// position-anchored review comments can be translated to file lines.
+/// Fetch the per-file patches for a GitHub PR as `path → patch`. Used to
+/// translate position-anchored comments and to validate comment placement.
+/// Files GitHub shows without a patch (binary, too large) are omitted.
+/// Returns `None` if any page fails to load.
 fn fetch_github_pr_patches(
     client: &reqwest::blocking::Client,
     headers: &HeaderMap,
-    config: &Config,
+    owner: &str,
+    repo: &str,
     pr_number: u32,
-) -> std::collections::HashMap<String, String> {
-    let url = format!(
-        "https://api.github.com/repos/{}/{}/pulls/{}/files?per_page=100",
-        config.owner, config.repo, pr_number
-    );
-    let mut out = std::collections::HashMap::new();
-    let resp = match client.get(&url).headers(headers.clone()).send() {
-        Ok(r) => r,
-        Err(_) => return out,
-    };
-    if !resp.status().is_success() {
-        return out;
-    }
-    let files: serde_json::Value = match resp.json() {
-        Ok(v) => v,
-        Err(_) => return out,
-    };
-    if let Some(arr) = files.as_array() {
+) -> Option<HashMap<String, String>> {
+    let mut out = HashMap::new();
+    // GitHub caps this endpoint at 3000 files (30 pages of 100).
+    for page in 1..=30 {
+        let url = format!(
+            "https://api.github.com/repos/{}/{}/pulls/{}/files?per_page=100&page={}",
+            owner, repo, pr_number, page
+        );
+        let resp = client.get(&url).headers(headers.clone()).send().ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let files: serde_json::Value = resp.json().ok()?;
+        let arr = files.as_array()?;
         for f in arr {
             if let (Some(filename), Some(patch)) = (f["filename"].as_str(), f["patch"].as_str()) {
                 out.insert(filename.to_string(), patch.to_string());
             }
         }
+        if arr.len() < 100 {
+            break;
+        }
     }
-    out
+    Some(out)
+}
+
+/// Validate `review`'s comment placement against the PR diff and report each
+/// problem in Neovim. Returns `false` only when invalid comments were found;
+/// if the diff can't be fetched it warns and returns `true` (don't block).
+fn check_github_placement(review: &Review, token: &str) -> bool {
+    match validate_github_review(review, token) {
+        Ok(problems) if problems.is_empty() => true,
+        Ok(problems) => {
+            api::err_writeln(&format!(
+                "{} comment(s) are on lines GitHub won't accept:",
+                problems.len()
+            ));
+            for p in &problems {
+                api::err_writeln(&format!("  {}", p));
+            }
+            false
+        }
+        Err(e) => {
+            warn(&format!("[vim-reviewer] skipping placement check: {}", e));
+            true
+        }
+    }
+}
+
+/// Lines a review comment may anchor to in one diff hunk: `(left, right)`,
+/// i.e. old-file lines (`-` and context) and new-file lines (`+` and context).
+type HunkLines = (HashSet<u32>, HashSet<u32>);
+
+fn patch_hunks(patch: &str) -> Vec<HunkLines> {
+    let mut hunks: Vec<HunkLines> = Vec::new();
+    let (mut old, mut new) = (0u32, 0u32);
+    for line in patch.lines() {
+        if line.starts_with("@@") {
+            if let Some((o, n)) = parse_hunk_header(line) {
+                (old, new) = (o, n);
+                hunks.push((HashSet::new(), HashSet::new()));
+            }
+            continue;
+        }
+        let Some((left, right)) = hunks.last_mut() else {
+            continue;
+        };
+        match line.chars().next() {
+            Some(' ') => {
+                left.insert(old);
+                right.insert(new);
+                old += 1;
+                new += 1;
+            }
+            Some('-') => {
+                left.insert(old);
+                old += 1;
+            }
+            Some('+') => {
+                right.insert(new);
+                new += 1;
+            }
+            _ => {} // "\ No newline at end of file"
+        }
+    }
+    hunks
+}
+
+/// Explain why GitHub would reject `comment` (already mapped to the PR head),
+/// or `None` if its placement is valid. `patches` is the output of
+/// `fetch_github_pr_patches`.
+fn github_placement_problem(
+    comment: &Comment,
+    patches: &HashMap<String, String>,
+) -> Option<String> {
+    let Some(patch) = patches.get(&to_git_path(&comment.path)) else {
+        return Some(
+            "file isn't in this PR's diff (or GitHub shows no diff for it, e.g. binary/too large)"
+                .to_string(),
+        );
+    };
+    let hunks = patch_hunks(patch);
+    let hunk_of = |line: u32, side: Side| {
+        hunks
+            .iter()
+            .position(|(left, right)| if side == Side::LEFT { left } else { right }.contains(&line))
+    };
+    let outside = |line: u32, side: Side| {
+        format!(
+            "{:?} line {} is outside the diff; GitHub only accepts changed lines and the few context lines shown around them",
+            side, line
+        )
+    };
+    let Some(end_hunk) = hunk_of(comment.line, comment.side) else {
+        return Some(outside(comment.line, comment.side));
+    };
+    if let Some(start) = comment.start_line
+        && start != comment.line
+    {
+        let start_side = comment.start_side.unwrap_or(comment.side);
+        match hunk_of(start, start_side) {
+            None => return Some(outside(start, start_side)),
+            Some(h) if h != end_hunk => {
+                return Some(format!(
+                    "range {}-{} spans two separate diff hunks; both ends must be in the same hunk",
+                    start, comment.line
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    None
+}
+
+/// Return the comments in `review` that GitHub would reject, each paired with
+/// a one-line description for the user. `Err` if the PR diff couldn't be
+/// fetched (validation is then skipped by callers).
+fn validate_github_review(review: &Review, token: &str) -> Result<Vec<String>, String> {
+    let client = reqwest::blocking::Client::new();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static("application/vnd.github+json"),
+    );
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("token {}", token)).map_err(|e| e.to_string())?,
+    );
+    headers.insert(USER_AGENT, HeaderValue::from_static("vim-reviewer"));
+    let patches = fetch_github_pr_patches(
+        &client,
+        &headers,
+        &review.owner,
+        &review.repo,
+        review.pr_number,
+    )
+    .ok_or("couldn't fetch the PR's file diffs from GitHub")?;
+    Ok(review
+        .publishable_comments()
+        .iter()
+        .filter_map(|c| {
+            github_placement_problem(c, &patches).map(|why| {
+                let first_line = c.body.lines().next().unwrap_or("");
+                let snippet: String = first_line.chars().take(40).collect();
+                let range = match c.start_line {
+                    Some(s) if s != c.line => format!("L{}-{}", s, c.line),
+                    _ => format!("L{}", c.line),
+                };
+                format!("{}:{} \"{}\": {}", c.path, range, snippet, why)
+            })
+        })
+        .collect())
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Clone)]
@@ -2727,7 +2948,9 @@ pub struct Comment {
     line: u32,
     path: String,
     side: Side,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     start_line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     start_side: Option<Side>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     commit_hash: Option<String>,
@@ -2853,7 +3076,7 @@ impl Review {
                     Some(mapped)
                 }
                 None => {
-                    api::err_writeln(&format!(
+                    warn(&format!(
                         "Skipping orphaned comment at {} L{} (anchor line was deleted).",
                         c.path, c.line
                     ));
@@ -2861,6 +3084,16 @@ impl Review {
                 }
             })
             .collect()
+    }
+
+    /// The comments as they will be sent: mapped forward from each `commit_hash`
+    /// to local HEAD (the user's intended publish target). If the repo or HEAD
+    /// can't be resolved, falls back to the comments as stored.
+    fn publishable_comments(&self) -> Vec<Comment> {
+        match (Repository::open_from_env(), current_head_sha()) {
+            (Ok(repo), Some(head_sha)) => self.comments_for_publish(&head_sha, &repo),
+            _ => self.comments.clone(),
+        }
     }
 
     fn publish_github(&self, token: String) -> Result<reqwest::blocking::Response, reqwest::Error> {
@@ -2878,18 +3111,9 @@ impl Review {
             headers.insert(USER_AGENT, HeaderValue::from_static("vim-reviewer"));
             headers
         }
-        // Map comments forward from their `commit_hash` to local HEAD (the user's
-        // intended publish target). If the repo or HEAD can't be resolved, fall
-        // back to sending the comments as-stored — at worst this is the pre-
-        // commit-hash behavior.
-        let mut body = match (Repository::open_from_env(), current_head_sha()) {
-            (Ok(repo), Some(head_sha)) => {
-                let mut mapped = self.clone();
-                mapped.comments = self.comments_for_publish(&head_sha, &repo);
-                serde_json::to_value(&mapped).unwrap_or_else(|_| serde_json::json!(&self))
-            }
-            _ => serde_json::to_value(self).unwrap_or(serde_json::Value::Null),
-        };
+        let mut mapped = self.clone();
+        mapped.comments = self.publishable_comments();
+        let mut body = serde_json::to_value(&mapped).unwrap_or(serde_json::Value::Null);
         // `commit_hash` is an internal anchor used for line-mapping; GitHub's
         // review API rejects unknown fields on individual comments, so strip it
         // before posting.
@@ -3301,6 +3525,20 @@ fn line_mapping_diff_opts(file_path: &str) -> git2::DiffOptions {
     diff_opts
 }
 
+/// Report a non-fatal problem to the user via Neovim's message area.
+///
+/// Use this (not `api::err_writeln`) in logic that plain `#[test]`s exercise.
+/// Those tests run outside Neovim, so the `nvim_*` symbols don't exist: on
+/// macOS `.cargo/config.toml` papers over that with `-undefined dynamic_lookup`,
+/// but on Linux (CI) any reachable `nvim_*` call is a hard link error. Under
+/// `cfg(test)` this prints to stderr instead.
+fn warn(msg: &str) {
+    #[cfg(not(test))]
+    api::err_writeln(msg);
+    #[cfg(test)]
+    eprintln!("{}", msg);
+}
+
 /// Every emitted line of one file's diff as `(old_lineno, new_lineno)` pairs;
 /// either side is `None` for added/deleted lines.
 type LineMap = Vec<(Option<u32>, Option<u32>)>;
@@ -3415,7 +3653,7 @@ fn current_head_sha() -> Option<String> {
     let repo = match Repository::open_from_env() {
         Ok(r) => r,
         Err(e) => {
-            api::err_writeln(&format!(
+            warn(&format!(
                 "[vim-reviewer] current_head_sha: failed to open repo: {}",
                 e
             ));
@@ -3425,7 +3663,7 @@ fn current_head_sha() -> Option<String> {
     match repo.revparse_single("HEAD") {
         Ok(obj) => Some(obj.id().to_string()),
         Err(e) => {
-            api::err_writeln(&format!(
+            warn(&format!(
                 "[vim-reviewer] current_head_sha: failed to resolve HEAD: {}",
                 e
             ));
@@ -3478,7 +3716,7 @@ fn comment_current_range(
         Ok(Some(n)) => n,
         Ok(None) => return None,
         Err(e) => {
-            api::err_writeln(&format!(
+            warn(&format!(
                 "[vim-reviewer] line mapping failed for {} L{} ({}..{}): {} \u{2014} using stored line.",
                 comment.path, orig_start, commit_hash, target_sha, e
             ));
@@ -3492,7 +3730,7 @@ fn comment_current_range(
             Ok(Some(n)) => n,
             Ok(None) => return None,
             Err(e) => {
-                api::err_writeln(&format!(
+                warn(&format!(
                     "[vim-reviewer] line mapping failed for {} L{} ({}..{}): {} \u{2014} using stored line.",
                     comment.path, orig_end, commit_hash, target_sha, e
                 ));
@@ -3533,7 +3771,7 @@ impl WorkdirMapper {
             .get_or_insert_with(|| match Repository::open_from_env() {
                 Ok(r) => Some(r),
                 Err(e) => {
-                    api::err_writeln(&format!(
+                    warn(&format!(
                         "[vim-reviewer] failed to open repo: {} \u{2014} using stored lines.",
                         e
                     ));
@@ -3568,7 +3806,7 @@ impl WorkdirMapper {
                 Some(repo) => match workdir_line_map(repo, &comment.path, commit_hash) {
                     Ok(m) => Some(m),
                     Err(e) => {
-                        api::err_writeln(&format!(
+                        warn(&format!(
                             "[vim-reviewer] line mapping failed for {} (from {}): {} \u{2014} using stored lines.",
                             comment.path, commit_hash, e
                         ));
@@ -3875,5 +4113,69 @@ mod workdir_mapper_tests {
         assert_eq!(mapper.range(&mk(None, 4)), Some((4, 4)));
         assert_eq!(mapper.range(&mk(None, 3)), None); // "c" was deleted
         assert_eq!(mapper.cache.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+
+    // Two hunks: new lines 10-14 (12-13 added) and 50-52 (old 48-50, one deleted).
+    const PATCH: &str = "@@ -10,3 +10,5 @@ fn a()\n ctx10\n ctx11\n+add12\n+add13\n ctx14\n@@ -48,3 +50,2 @@ fn b()\n ctx50\n-del49\n ctx51\n";
+
+    fn patches() -> HashMap<String, String> {
+        HashMap::from([("src/a.py".to_string(), PATCH.to_string())])
+    }
+
+    fn c(path: &str, side: Side, start: Option<u32>, line: u32) -> Comment {
+        Comment::new(
+            "b".into(),
+            line,
+            path.into(),
+            side,
+            start,
+            start.map(|_| side),
+            None,
+        )
+    }
+
+    #[test]
+    fn accepts_changed_and_context_lines() {
+        let p = patches();
+        for comment in [
+            c("src/a.py", Side::RIGHT, None, 12),
+            c("src/a.py", Side::RIGHT, None, 10),
+            c("src/a.py", Side::RIGHT, Some(10), 14),
+            c("src/a.py", Side::LEFT, None, 49),
+            c("src/a.py", Side::RIGHT, None, 51),
+            // Windows-style path is normalized.
+            c("src\\a.py", Side::RIGHT, None, 13),
+        ] {
+            assert_eq!(github_placement_problem(&comment, &p), None);
+        }
+    }
+
+    #[test]
+    fn rejects_lines_outside_hunks() {
+        let p = patches();
+        assert!(github_placement_problem(&c("src/a.py", Side::RIGHT, None, 30), &p).is_some());
+        // Start of range falls just before the hunk (the old `line - 1` bug).
+        assert!(github_placement_problem(&c("src/a.py", Side::RIGHT, Some(9), 10), &p).is_some());
+        // Deleted line isn't on the RIGHT side.
+        assert!(github_placement_problem(&c("src/a.py", Side::RIGHT, None, 15), &p).is_some());
+    }
+
+    #[test]
+    fn rejects_range_across_hunks_and_unknown_files() {
+        let p = patches();
+        let why = github_placement_problem(&c("src/a.py", Side::RIGHT, Some(12), 50), &p).unwrap();
+        assert!(why.contains("two separate diff hunks"), "{}", why);
+        assert!(github_placement_problem(&c("other.py", Side::RIGHT, None, 1), &p).is_some());
+    }
+
+    #[test]
+    fn single_line_comment_omits_start_fields_when_serialized() {
+        let v = serde_json::to_value(c("a", Side::RIGHT, None, 3)).unwrap();
+        assert!(v.get("start_line").is_none() && v.get("start_side").is_none());
     }
 }
